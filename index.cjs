@@ -42,7 +42,7 @@ const ffmpegPath = require("ffmpeg-static");
 })();
 
 const TOKEN     = process.env.TOKEN;
-const CLIENT_ID = "1480592876684706064";
+const CLIENT_ID = process.env.CLIENT_ID; // BETA: application ID for the RoyalBot-BETA bot account — set as a repo secret
 const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
 const OWNER_ID  = OWNER_IDS[1];
 const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
@@ -617,14 +617,14 @@ function cacheQuoteFolder(fileName, folder) { quoteFileFolderCache.set(fileName,
 // Builds a raw.githubusercontent.com URL for a quote file, using the cached folder if known.
 function quoteRawUrl(fileName, folderHint) {
   const folder = folderHint || quoteFileFolderCache.get(fileName) || "quotes";
-  return `https://raw.githubusercontent.com/Royal-V-RR/discord-bot/main/${folder}/${encodeURIComponent(fileName)}`;
+  return `https://raw.githubusercontent.com/${GH_REPO || "RoyalBot-BETA/discord-bot"}/main/${folder}/${encodeURIComponent(fileName)}`;
 }
 
 // Lists the contents of a single quote folder via the GitHub Contents API, tagging every
 // file with which folder it came from and populating the folder cache as a side effect.
 async function fetchQuoteFolderFiles(folder) {
   try {
-    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "Royal-V-RR/discord-bot"}/contents/${folder}`, {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${folder}`, {
       headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}` }
     });
     if (!res.ok) return [];
@@ -649,7 +649,7 @@ async function resolveQuoteGhPath(fileName) {
   const cached = quoteFileFolderCache.get(fileName);
   if (cached) return `${cached}/${fileName}`;
   for (const folder of QUOTE_FOLDERS) {
-    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "Royal-V-RR/discord-bot"}/contents/${folder}/${encodeURIComponent(fileName)}`, {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${folder}/${encodeURIComponent(fileName)}`, {
       headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}`, "Accept": "application/vnd.github+json" }
     });
     if (res.ok) { cacheQuoteFolder(fileName, folder); return `${folder}/${fileName}`; }
@@ -2540,7 +2540,7 @@ async function buildTomatoGif(msgContent, authorTag, tomatoCount, speedMin = 50,
     .toBuffer();
 
   // ── 2. Fetch tomato-splat.gif ─────────────────────────────────────────────
-  const tomatoUrl = "https://raw.githubusercontent.com/Royal-V-RR/discord-bot/main/tomato-splat.gif";
+  const tomatoUrl = `https://raw.githubusercontent.com/${GH_REPO || "RoyalBot-BETA/discord-bot"}/main/tomato-splat.gif`;
   const tRes = await fetch(tomatoUrl);
   if(!tRes.ok) throw new Error(`Could not fetch tomato-splat.gif (HTTP ${tRes.status})`);
   const tomatoGifBuf = Buffer.from(await tRes.arrayBuffer());
@@ -5562,13 +5562,13 @@ client.on("interactionCreate",async interaction=>{
         if(!(await btnAck(interaction))) return;
         try {
           const ghPath = await resolveQuoteGhPath(fileName);
-          const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+          const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
             headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
           });
           if(!checkRes.ok){ await interaction.followUp({content:`❌ File not found or GitHub error (HTTP ${checkRes.status}).`,ephemeral:true}); return; }
           const fileData = await checkRes.json();
           const sha = fileData.sha;
-          const delRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+          const delRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
             method:"DELETE",
             headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
             body: JSON.stringify({message:`chore: delete quote image ${fileName} via Discord`,sha})
@@ -9032,7 +9032,7 @@ if(cmd==="gif"){
       try {
         const ghPath = await resolveQuoteGhPath(fileName);
         // Fetch the file's SHA (required for deletion)
-        const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
         });
         if(checkRes.status===404) return safeReply(interaction,{content:`❌ File \`${fileName}\` not found in either quotes folder.`,ephemeral:true});
@@ -9041,7 +9041,7 @@ if(cmd==="gif"){
         const sha = fileData.sha;
         if(!sha) return safeReply(interaction,{content:"❌ Couldn't retrieve file SHA for deletion.",ephemeral:true});
         // Delete the file
-        const delRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+        const delRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
           method:"DELETE",
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
           body: JSON.stringify({ message:`chore: delete quote image ${fileName} via Discord`, sha })
@@ -9130,13 +9130,13 @@ if(cmd==="gif"){
         const ghPath  = `quotes2/${fileName}`; // /upload always writes to quotes2, never quotes
         const encoded = fileBuffer.toString("base64");
 
-        const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
         });
         let sha = null;
         if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha||null; }
 
-        const putRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
+        const putRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
           method:"PUT",
           headers:{
             "User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,
