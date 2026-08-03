@@ -78069,10 +78069,12 @@
       "1533774845735604235",
       {
         "filename": "quote_232.png",
-        "voters": [],
+        "voters": [
+          "1254388539890860083"
+        ],
         "guildId": "1533594455125397654",
         "channelId": "1533594456274505861",
-        "sentToDeleter": false
+        "sentToDeleter": true
       }
     ]
   ],
