@@ -479,13 +479,9 @@
         "ytChannelId": "UC4PeFFYzg1xjkb1VcGZVcqQ",
         "channelTitle": "RespawnRaccoon",
         "discordChannelId": "1483595393999700080",
-        "lastSubs": 15800,
-        "lastSubsTimestamp": 1786262209206,
+        "lastSubs": 15900,
+        "lastSubsTimestamp": 1786262659268,
         "history": [
-          {
-            "ts": 1785922791915,
-            "subs": 15600
-          },
           {
             "ts": 1785923091926,
             "subs": 15600
@@ -4481,6 +4477,10 @@
           {
             "ts": 1786262209206,
             "subs": 15800
+          },
+          {
+            "ts": 1786262659268,
+            "subs": 15900
           }
         ],
         "subcountDiscordId": "1483595393999700080",
