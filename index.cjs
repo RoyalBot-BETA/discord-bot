@@ -42,7 +42,7 @@ const ffmpegPath = require("ffmpeg-static");
 })();
 
 const TOKEN     = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID; // BETA: application ID for the RoyalBot-BETA bot account — set as a repo secret
+const CLIENT_ID = "1480592876684706064";
 const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
 const OWNER_ID  = OWNER_IDS[1];
 const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
@@ -617,14 +617,14 @@ function cacheQuoteFolder(fileName, folder) { quoteFileFolderCache.set(fileName,
 // Builds a raw.githubusercontent.com URL for a quote file, using the cached folder if known.
 function quoteRawUrl(fileName, folderHint) {
   const folder = folderHint || quoteFileFolderCache.get(fileName) || "quotes";
-  return `https://raw.githubusercontent.com/${GH_REPO || "RoyalBot-BETA/discord-bot"}/main/${folder}/${encodeURIComponent(fileName)}`;
+  return `https://raw.githubusercontent.com/Royal-V-RR/discord-bot/main/${folder}/${encodeURIComponent(fileName)}`;
 }
 
 // Lists the contents of a single quote folder via the GitHub Contents API, tagging every
 // file with which folder it came from and populating the folder cache as a side effect.
 async function fetchQuoteFolderFiles(folder) {
   try {
-    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${folder}`, {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "Royal-V-RR/discord-bot"}/contents/${folder}`, {
       headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}` }
     });
     if (!res.ok) return [];
@@ -649,12 +649,41 @@ async function resolveQuoteGhPath(fileName) {
   const cached = quoteFileFolderCache.get(fileName);
   if (cached) return `${cached}/${fileName}`;
   for (const folder of QUOTE_FOLDERS) {
-    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${folder}/${encodeURIComponent(fileName)}`, {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "Royal-V-RR/discord-bot"}/contents/${folder}/${encodeURIComponent(fileName)}`, {
       headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}`, "Accept": "application/vnd.github+json" }
     });
     if (res.ok) { cacheQuoteFolder(fileName, folder); return `${folder}/${fileName}`; }
   }
   return `quotes/${fileName}`; // fallback default — matches legacy behavior
+}
+
+// ── Jarvis image trigger folder ───────────────────────────────────────────────
+// Word-triggered images: a message starting with "RoyalBot" or "Jarvis" that's a
+// reply, and that also contains a word matching a filename in this GitHub folder
+// (e.g. carpenter.png → the word "carpenter"), makes the bot reply to the ORIGINAL
+// message (the one being replied to) with that image. Drop a new image into the
+// "jarvis" folder and it works immediately — no code changes needed.
+const JARVIS_FOLDER = "jarvis";
+let jarvisImageCache = []; // [{ name, word, download_url }]
+let jarvisCacheFetchedAt = 0;
+const JARVIS_CACHE_TTL_MS = 2 * 60 * 1000; // refresh at most every 2 minutes
+
+async function getJarvisImages() {
+  const now = Date.now();
+  if (jarvisImageCache.length && (now - jarvisCacheFetchedAt) < JARVIS_CACHE_TTL_MS) return jarvisImageCache;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${GH_REPO || "Royal-V-RR/discord-bot"}/contents/${JARVIS_FOLDER}`, {
+      headers: { "User-Agent": "RoyalBot", "Authorization": `token ${GH_TOKEN}` }
+    });
+    if (!res.ok) return jarvisImageCache; // keep stale cache on failure
+    const files = await res.json();
+    if (!Array.isArray(files)) return jarvisImageCache;
+    jarvisImageCache = files
+      .filter(f => f.type === "file" && /\.(png|jpe?g|gif|webp)$/i.test(f.name))
+      .map(f => ({ name: f.name, word: f.name.replace(/\.[a-z0-9]+$/i, "").toLowerCase(), download_url: f.download_url }));
+    jarvisCacheFetchedAt = now;
+  } catch(e) { console.error("Jarvis folder fetch failed:", e.message); }
+  return jarvisImageCache;
 }
 
 // ── /download helpers (YouTube fetch + split-to-fit) ─────────────────────────
@@ -1130,7 +1159,7 @@ function buildDataObject() {
     reviewChannelId:      reviewChannelId,
     deleterChannelId:     deleterChannelId,
     trashcanThreshold:    trashcanThreshold,
-    trashcanVotes:        [...trashcanVotes.entries()].map(([k,v])=>[k,{filename:v.filename,voters:[...v.voters],guildId:v.guildId,channelId:v.channelId,sentToDeleter:v.sentToDeleter}]),
+    trashcanVotes:        [...trashcanVotes.entries()].map(([k,v])=>[k,{filename:v.filename,voters:[...v.voters],guildId:v.guildId,channelId:v.channelId,sentToDeleter:v.sentToDeleter,type:v.type||"quote"}]),
     selfClankUsers:       [...selfClankUsers.entries()].map(([guildId,set])=>[guildId,[...set]]),
     selfClankCooldown:    [...selfClankCooldown.entries()],
     pendingReviews:       [...pendingReviews.entries()],
@@ -1343,7 +1372,7 @@ function loadData() {
     if (data.botStatus && typeof data.botStatus === "object" && data.botStatus.text) {
       botStatus = { text: data.botStatus.text, type: data.botStatus.type || "PLAYING" };
     }
-    if (data.trashcanVotes) data.trashcanVotes.forEach(([k,v]) => trashcanVotes.set(k, { filename: v.filename, voters: new Set(v.voters||[]), guildId: v.guildId, channelId: v.channelId, sentToDeleter: v.sentToDeleter||false }));
+    if (data.trashcanVotes) data.trashcanVotes.forEach(([k,v]) => trashcanVotes.set(k, { filename: v.filename, voters: new Set(v.voters||[]), guildId: v.guildId, channelId: v.channelId, sentToDeleter: v.sentToDeleter||false, type: v.type||"quote" }));
     if (data.selfClankUsers) data.selfClankUsers.forEach(([guildId, arr]) => selfClankUsers.set(guildId, new Set(arr)));
     if (data.selfClankCooldown) {
       const now = Date.now();
@@ -1401,7 +1430,7 @@ setInterval(async () => {
       const sent = await safeSend(ch, { content: `🌅 **Daily Quote**`, files: [chosen.download_url] });
       if (sent) {
         quoteVoteMessages.set(sent.id, chosen.name);
-        const trashEntry = { filename: chosen.name, voters: new Set(), guildId, channelId: cfg.channelId, sentToDeleter: false };
+        const trashEntry = { filename: chosen.name, voters: new Set(), guildId, channelId: cfg.channelId, sentToDeleter: false, type: "quote" };
         trashcanVotes.set(sent.id, trashEntry);
         const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
         await sent.edit({ components: voteButtons }).catch(()=>{});
@@ -1607,6 +1636,95 @@ const PARANOIA_MESSAGES = [
   "The darkness takes away",
 ];
 
+// ── Jarvis owner acknowledgment lines ─────────────────────────────────────────
+// Said (as a reply to the command-runner) when an OWNER triggers the Jarvis image
+// trigger using the "Jarvis" wake word specifically (not "RoyalBot").
+const JARVIS_ACK_LINES = [
+  "Great choice, Sir.",
+  "Amazing pick, Sir.",
+  "Very fitting.",
+  "Excellent choice, Sir.",
+  "A fine selection, Sir.",
+  "An excellent decision.",
+  "Most suitable, Sir.",
+  "A rather distinguished choice.",
+  "Very well chosen, Sir.",
+  "A commendable selection.",
+  "Quite appropriate, Sir.",
+  "An impeccable choice.",
+  "As expected, Sir.",
+  "A sound decision.",
+  "Very tasteful, Sir.",
+  "Precisely what I would have chosen.",
+  "A decision worthy of you, Sir.",
+  "Most elegant.",
+  "A remarkably good choice.",
+  "I approve, Sir.",
+  "Excellent taste, as always.",
+  "Quite the refined selection.",
+  "A splendid choice.",
+  "Now that is a choice, Sir.",
+  "I knew you had good taste.",
+  "I was hoping you'd pick that one.",
+  "Excellent. I was beginning to worry.",
+  "Well, you certainly know what you're doing.",
+  "A surprisingly intelligent decision, Sir.",
+  "Impressive, Sir. Genuinely.",
+  "You've outdone yourself.",
+  "I must admit, I'm impressed.",
+  "Bold. I like it.",
+  "Risky, but tasteful.",
+  "Oh, that's a good one.",
+  "Now we're talking.",
+  "Finally, a decision I can endorse.",
+  "I see you've chosen wisely.",
+  "Excellent judgment, Sir. As usual.",
+  "You make this look effortless.",
+  "A choice with character.",
+  "I knew you'd come around.",
+  "That'll do nicely, Sir.",
+  "Very good, Sir.",
+  "Right away, Sir.",
+  "Consider it done.",
+  "At once, Sir.",
+  "As you wish.",
+  "Certainly, Sir.",
+  "Understood.",
+  "Of course, Sir.",
+  "A pleasure, Sir.",
+  "Naturally.",
+  "As you command.",
+  "I shall make the necessary arrangements.",
+  "Everything is in order, Sir.",
+  "The selection has been noted.",
+  "An excellent configuration, Sir.",
+  "That should serve you rather well.",
+  "I believe you'll find that satisfactory.",
+  "A most sensible selection.",
+  "Very good taste, Sir.",
+  "I shall remember that preference.",
+  "...Interesting choice, Sir.",
+  "If you're quite certain, Sir.",
+  "I'll pretend I didn't question that decision.",
+  "An unconventional choice.",
+  "Bold of you, Sir.",
+  "I suppose we're doing this now.",
+  "Very well. I have my reservations.",
+  "I cannot endorse this, but I shall proceed.",
+  "That is certainly a choice.",
+  "Fascinating. Not what I expected.",
+  "I trust you have a plan.",
+  "Sir, are you absolutely certain?",
+  "I shall refrain from commenting.",
+  "Well... fortune favors the bold.",
+  "I've recorded your decision. Against my better judgment.",
+  "Noted, Sir. I'm sure this will end well.",
+  "An unusual display of confidence.",
+  "Very well. Let history judge us.",
+  "I admire your commitment to chaos.",
+  "I have concerns, Sir. Proceeding regardless.",
+];
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const r    = (min,max) => Math.floor(Math.random()*(max-min+1))+min;
 const pick = arr => arr[Math.floor(Math.random()*arr.length)];
@@ -1654,6 +1772,17 @@ function openItemMysteryBox(){
   if(result === "coins_tiny")  return {type:"coins", coins:5};
   if(result === "coins_small") return {type:"coins", coins:r(20,80)};
   return {type:"item", itemId:result};
+}
+
+// ── Patreon promo — small random chance shown after a command finishes ───────
+const PROMO_CHANCE   = 0.08; // ~8% chance per command
+const PROMO_MESSAGE  = "Enjoying the commands? How about you get to be a part of the creative process? It is unfortunately paid, but please consider https://www.patreon.com/c/RoyalV_/membership";
+async function maybeSendPromo(interaction) {
+  try {
+    if (Math.random() >= PROMO_CHANCE) return;
+    if (!interaction.replied && !interaction.deferred) return; // nothing to follow up on
+    await interaction.followUp({ content: PROMO_MESSAGE, ephemeral: true }).catch(() => {});
+  } catch {}
 }
 
 async function safeReply(interaction, payload) {
@@ -2540,7 +2669,7 @@ async function buildTomatoGif(msgContent, authorTag, tomatoCount, speedMin = 50,
     .toBuffer();
 
   // ── 2. Fetch tomato-splat.gif ─────────────────────────────────────────────
-  const tomatoUrl = `https://raw.githubusercontent.com/${GH_REPO || "RoyalBot-BETA/discord-bot"}/main/tomato-splat.gif`;
+  const tomatoUrl = "https://raw.githubusercontent.com/Royal-V-RR/discord-bot/main/tomato-splat.gif";
   const tRes = await fetch(tomatoUrl);
   if(!tRes.ok) throw new Error(`Could not fetch tomato-splat.gif (HTTP ${tRes.status})`);
   const tomatoGifBuf = Buffer.from(await tRes.arrayBuffer());
@@ -3707,39 +3836,57 @@ function findQuoteUploader(filename) {
   return null;
 }
 
+// Labels/emoji for the "New quote" button, keyed by quote type.
+const QUOTE_NEW_BUTTON = {
+  quote: { label: "New quote",      emoji: "✨" },
+  good:  { label: "New good quote", emoji: "⭐" },
+  bad:   { label: "New bad quote",  emoji: "💀" },
+};
+
 function makeQuoteVoteButtons(msgId, votes, trashData) {
   const v      = votes || { up: 0, down: 0 };
   const trash  = trashData?.voters?.size ?? 0;
+  const type   = trashData?.type || "quote";
   const goodE  = appEmojiCache.get("goodquote");
   const badE   = appEmojiCache.get("badquote");
   const trashE = appEmojiCache.get("raccoontrashcan");
-  return [new MessageActionRow().addComponents(
-    new MessageButton()
-      .setCustomId(`qvote_up_${msgId}`)
-      .setLabel(String(v.up))
-      .setStyle("SUCCESS")
-      .setEmoji(goodE  ? { id: goodE.id,  name: goodE.name  } : { name: "👍" }),
-    new MessageButton()
-      .setCustomId(`qvote_down_${msgId}`)
-      .setLabel(String(v.down))
-      .setStyle("DANGER")
-      .setEmoji(badE   ? { id: badE.id,   name: badE.name   } : { name: "👎" }),
-    new MessageButton()
-      .setCustomId(`qvote_trash_${msgId}`)
-      .setLabel(String(trash))
-      .setStyle("SECONDARY")
-      .setEmoji(trashE ? { id: trashE.id, name: trashE.name } : { name: "🗑️" }),
-    new MessageButton()
-      .setCustomId(`qvote_who_${msgId}`)
-      .setLabel("Who?")
-      .setStyle("SECONDARY")
-      .setEmoji({ name: "👥" }),
-    new MessageButton()
-      .setCustomId(`qvote_uploader_${msgId}`)
-      .setLabel("Uploader")
-      .setStyle("SECONDARY")
-      .setEmoji({ name: "🖼️" }),
-  )];
+  const newBtn = QUOTE_NEW_BUTTON[type] || QUOTE_NEW_BUTTON.quote;
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId(`qvote_up_${msgId}`)
+        .setLabel(String(v.up))
+        .setStyle("SUCCESS")
+        .setEmoji(goodE  ? { id: goodE.id,  name: goodE.name  } : { name: "👍" }),
+      new MessageButton()
+        .setCustomId(`qvote_down_${msgId}`)
+        .setLabel(String(v.down))
+        .setStyle("DANGER")
+        .setEmoji(badE   ? { id: badE.id,   name: badE.name   } : { name: "👎" }),
+      new MessageButton()
+        .setCustomId(`qvote_trash_${msgId}`)
+        .setLabel(String(trash))
+        .setStyle("SECONDARY")
+        .setEmoji(trashE ? { id: trashE.id, name: trashE.name } : { name: "🗑️" }),
+      new MessageButton()
+        .setCustomId(`qvote_who_${msgId}`)
+        .setLabel("Who?")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "👥" }),
+      new MessageButton()
+        .setCustomId(`qvote_uploader_${msgId}`)
+        .setLabel("Uploader")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "🖼️" }),
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton()
+        .setCustomId(`qnew_${type}`)
+        .setLabel(newBtn.label)
+        .setStyle("PRIMARY")
+        .setEmoji({ name: newBtn.emoji }),
+    ),
+  ];
 }
 
 // ── Reaction roles ────────────────────────────────────────────────────────────
@@ -4707,6 +4854,37 @@ client.on("messageCreate",async msg=>{
     }
   }
 
+  // ── Jarvis / RoyalBot image trigger ──────────────────────────────────────────
+  // Message must be a reply AND start with the wake word "RoyalBot" or "Jarvis".
+  // If it also contains a word matching a filename in the jarvis folder, the bot
+  // replies to the ORIGINAL message (the one being replied to) with that image.
+  // If the wake word is specifically "Jarvis" (not "RoyalBot") and the author is
+  // an owner, Jarvis also acknowledges the command-runner with a flavor line.
+  if(msg.reference){
+    const wakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b/i);
+    if(wakeMatch){
+      try {
+        const jarvisImages = await getJarvisImages();
+        if(jarvisImages.length){
+          const words = (msg.content.toLowerCase().match(/[a-z0-9]+/g)) || [];
+          const wordSet = new Set(words);
+          const hit = jarvisImages.find(img => wordSet.has(img.word));
+          if(hit){
+            const target = await msg.fetchReference().catch(() => null);
+            if(target){
+              await target.reply({ files: [hit.download_url], allowedMentions: { repliedUser: false } }).catch(()=>{});
+              const isJarvisWake = wakeMatch[1].toLowerCase() === "jarvis";
+              if(isJarvisWake && OWNER_IDS.includes(msg.author.id)){
+                const ackLine = JARVIS_ACK_LINES[Math.floor(Math.random() * JARVIS_ACK_LINES.length)];
+                await msg.reply({ content: ackLine, allowedMentions: { repliedUser: false } }).catch(()=>{});
+              }
+            }
+          }
+        }
+      } catch(e) { console.error("Jarvis trigger error:", e.message); }
+    }
+  }
+
   // ── Permanent counting channel ────────────────────────────────────────────
   const cc=countingChannels.get(msg.channelId);
   if(cc){
@@ -4995,6 +5173,44 @@ client.on("interactionCreate",async interaction=>{
       }catch(e){
         console.error("del_delete error:",e);
         await interaction.followUp({content:"❌ Something went wrong during deletion.",ephemeral:true}).catch(()=>{});
+      }
+      return;
+    }
+
+    // ── "New quote" / "New good quote" / "New bad quote" buttons ────────────────
+    // qnew_quote, qnew_good, qnew_bad — sends a fresh quote message, same as re-running the command.
+    if(cid==="qnew_quote" || cid==="qnew_good" || cid==="qnew_bad"){
+      const qType = cid.slice(5); // "quote" | "good" | "bad"
+      const now_q = Date.now();
+      const last_q = quoteCooldown.get(uid) || 0;
+      if (now_q - last_q < 1500) {
+        try{ await interaction.reply({content:"Man chill tf out, 1.5 sec timeout",ephemeral:true}); }catch{}
+        return;
+      }
+      quoteCooldown.set(uid, now_q);
+      await interaction.deferUpdate().catch(()=>{});
+      try {
+        const chosen = qType==="good" ? await nextGoodQuoteImage()
+                     : qType==="bad"  ? await nextBadQuoteImage()
+                     : await nextQuoteImage();
+        if(!chosen){
+          await interaction.followUp({content:"Couldn't load quotes right now.",ephemeral:true}).catch(()=>{});
+          return;
+        }
+        const payload = Math.random() < 0.10
+          ? { content: "Do you wish to contribute to /quote? run /requestupload to send in your best quotes, screenshots or memes!", files: [chosen.download_url] }
+          : { files: [chosen.download_url] };
+        const sentMsg = await interaction.channel.send(payload).catch(()=>null);
+        if(sentMsg){
+          quoteVoteMessages.set(sentMsg.id, chosen.name);
+          const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false, type: qType };
+          trashcanVotes.set(sentMsg.id, trashEntry);
+          const voteButtons = makeQuoteVoteButtons(sentMsg.id, quoteVotes.get(chosen.name), trashEntry);
+          await sentMsg.edit({ components: voteButtons }).catch(()=>{});
+          saveData();
+        }
+      } catch(e){
+        console.error("qnew_ button error:", e.message);
       }
       return;
     }
@@ -5562,13 +5778,13 @@ client.on("interactionCreate",async interaction=>{
         if(!(await btnAck(interaction))) return;
         try {
           const ghPath = await resolveQuoteGhPath(fileName);
-          const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+          const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
             headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
           });
           if(!checkRes.ok){ await interaction.followUp({content:`❌ File not found or GitHub error (HTTP ${checkRes.status}).`,ephemeral:true}); return; }
           const fileData = await checkRes.json();
           const sha = fileData.sha;
-          const delRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+          const delRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
             method:"DELETE",
             headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
             body: JSON.stringify({message:`chore: delete quote image ${fileName} via Discord`,sha})
@@ -7395,7 +7611,7 @@ if(cmd==="gif"){
             const msg = sent.id ? sent : await interaction.fetchReply().catch(()=>null);
             if(msg){
               quoteVoteMessages.set(msg.id, chosen.name);
-              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false };
+              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false, type: "quote" };
               trashcanVotes.set(msg.id, trashEntry);
               const voteButtons = makeQuoteVoteButtons(msg.id, quoteVotes.get(chosen.name), trashEntry);
               await msg.edit({ components: voteButtons }).catch(()=>{});
@@ -7432,7 +7648,7 @@ if(cmd==="gif"){
             const msg = sent.id ? sent : await interaction.fetchReply().catch(()=>null);
             if(msg){
               quoteVoteMessages.set(msg.id, chosen.name);
-              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false };
+              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false, type: "good" };
               trashcanVotes.set(msg.id, trashEntry);
               const voteButtons = makeQuoteVoteButtons(msg.id, quoteVotes.get(chosen.name), trashEntry);
               await msg.edit({ components: voteButtons }).catch(()=>{});
@@ -7469,7 +7685,7 @@ if(cmd==="gif"){
             const msg = sent.id ? sent : await interaction.fetchReply().catch(()=>null);
             if(msg){
               quoteVoteMessages.set(msg.id, chosen.name);
-              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false };
+              const trashEntry = { filename: chosen.name, voters: new Set(), guildId: interaction.guildId||null, channelId: interaction.channelId||null, sentToDeleter: false, type: "bad" };
               trashcanVotes.set(msg.id, trashEntry);
               const voteButtons = makeQuoteVoteButtons(msg.id, quoteVotes.get(chosen.name), trashEntry);
               await msg.edit({ components: voteButtons }).catch(()=>{});
@@ -9032,7 +9248,7 @@ if(cmd==="gif"){
       try {
         const ghPath = await resolveQuoteGhPath(fileName);
         // Fetch the file's SHA (required for deletion)
-        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+        const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
         });
         if(checkRes.status===404) return safeReply(interaction,{content:`❌ File \`${fileName}\` not found in either quotes folder.`,ephemeral:true});
@@ -9041,7 +9257,7 @@ if(cmd==="gif"){
         const sha = fileData.sha;
         if(!sha) return safeReply(interaction,{content:"❌ Couldn't retrieve file SHA for deletion.",ephemeral:true});
         // Delete the file
-        const delRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+        const delRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
           method:"DELETE",
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json","Content-Type":"application/json"},
           body: JSON.stringify({ message:`chore: delete quote image ${fileName} via Discord`, sha })
@@ -9130,13 +9346,13 @@ if(cmd==="gif"){
         const ghPath  = `quotes2/${fileName}`; // /upload always writes to quotes2, never quotes
         const encoded = fileBuffer.toString("base64");
 
-        const checkRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+        const checkRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
           headers:{"User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,"Accept":"application/vnd.github+json"}
         });
         let sha = null;
         if(checkRes.ok){ const j=await checkRes.json(); sha=j.sha||null; }
 
-        const putRes = await fetch(`https://api.github.com/repos/${GH_REPO || "RoyalBot-BETA/discord-bot"}/contents/${ghPath}`,{
+        const putRes = await fetch(`https://api.github.com/repos/Royal-V-RR/discord-bot/contents/${ghPath}`,{
           method:"PUT",
           headers:{
             "User-Agent":"RoyalBot","Authorization":`token ${GH_TOKEN}`,
@@ -9748,6 +9964,9 @@ if(cmd==="gif"){
     // If the interaction has already timed out (INTERACTION_ALREADY_REPLIED or unknown),
     // safeReply will silently swallow the error — that's intentional.
     safeReply(interaction, {content:"❌ An error occurred processing that command.", ephemeral:true});
+  } finally {
+    // Fires after every command, no matter which branch/return path handled it.
+    maybeSendPromo(interaction);
   }
 });
 
