@@ -58769,6 +58769,10 @@
     [
       "1539441357716988065",
       "quote_198.png"
+    ],
+    [
+      "1542987295186096269",
+      "quote_209.jpg"
     ]
   ],
   "reviewChannelId": "1533778635373281421",
@@ -80283,6 +80287,17 @@
         "voters": [],
         "guildId": "1533594455125397654",
         "channelId": "1533594456274505861",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
+    ],
+    [
+      "1542987295186096269",
+      {
+        "filename": "quote_209.jpg",
+        "voters": [],
+        "guildId": "1533594455125397654",
+        "channelId": "1533606778112053478",
         "sentToDeleter": false,
         "type": "quote"
       }
