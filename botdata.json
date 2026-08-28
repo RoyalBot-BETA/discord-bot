@@ -4528,6 +4528,8 @@
     "1520763926105821276"
   ],
   "blacklistedUsers": [],
+  "silentBlacklistUsers": [],
+  "tempOwnerGrants": [],
   "scores": [
     [
       "1245284545452834857",
