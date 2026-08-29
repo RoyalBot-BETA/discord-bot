@@ -244,6 +244,8 @@
       }
     ]
   ],
+  "theCountChannels": [],
+  "betaTestingConfigs": [],
   "reactionRoles": [
     [
       "1408975996715139084:1483218332005175427:🤖",
@@ -4527,8 +4529,7 @@
     "1193150033864949811",
     "1520763926105821276"
   ],
-  "blacklistedUsers": [],
-  "silentBlacklistUsers": [],
+  "featureBlacklist": [],
   "tempOwnerGrants": [],
   "scores": [
     [
@@ -4901,7 +4902,7 @@
         "dailyStreak": 1,
         "bestStreak": 1,
         "lastDailyDate": "2026-04-27",
-        "xp": 3393,
+        "xp": 3420,
         "level": 28,
         "lastWorkTime": 0,
         "lastBegTime": 0,
