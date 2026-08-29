@@ -255,8 +255,22 @@ const openTickets      = new Map();
 const premieres        = new Map(); // premiereId -> { title, endsAt, channelId, userId, messageId, guildId }
 const disabledLevelUp  = new Set(); // legacy — now superseded by levelUpConfig.enabled
 const userInstalls     = new Set();
-const blacklistedUsers = new Set(); // Users banned from ever running any command or using bot features — persisted in botdata.json
-const silentBlacklistUsers = new Set(); // Subset of blacklistedUsers whose block is completely silent — no DM notice, no reactions, no messages of any kind
+// featureBlacklist: userId -> { features: Set<string>, silent: boolean }
+// "all" in features means a full blacklist (blocked from every command/feature);
+// any other value is a specific command/feature name blocked just for that user.
+// Persisted in botdata.json.
+const featureBlacklist = new Map();
+function isFeatureBlacklisted(userId, featureName){
+  const b = featureBlacklist.get(userId);
+  if(!b) return false;
+  return b.features.has("all") || b.features.has(featureName);
+}
+function isFullyBlacklisted(userId){
+  return !!featureBlacklist.get(userId)?.features.has("all");
+}
+function isSilentBlacklisted(userId){
+  return !!featureBlacklist.get(userId)?.silent;
+}
 const activityChecks   = new Map(); // messageId -> { guildId, channelId, roleIds, deadline, respondedUsers: Set }
 const scheduledChecks  = new Map(); // `${guildId}:${channelId}` -> { guildId, channelId, dayOfWeek, hour, minute, deadlineHr, customMsg, doPing, roleIds, excludedIds, nextFire }
 const raConfig         = new Map(); // guildId -> { raRoleId, loaRoleId }
@@ -490,9 +504,29 @@ function isEffectiveOwner(userId, commandName){
 }
 
 // ── /tempowner — interactive picker ─────────────────────────────────────────
-const GRANTABLE_OWNER_CMDS = ["servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","forcemarry","forcedivorce","echo","paranoia","theremnant"];
+const GRANTABLE_OWNER_CMDS = ["servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant"];
+
+// ── /betatesting — channel-scoped owner command access ─────────────────────
+// Unlike /tempowner (global, any channel), access here only works inside the
+// beta-testing category's own channels. Excludes anything involving quote
+// deletion (deleter/requester/quote_review/quote_manager) or relay/hub setup (dmconfig).
+const BETA_TESTING_CMDS = ["servers","fakemessage","fakequote","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant"];
+const betaTestingConfigs = new Map(); // guildId -> { categoryId, channelIds:[id1,id2], testers: Map<userId,{expiresAt:number|null}> }
+function isBetaTesterAllowed(userId, guildId, channelId, cmd){
+  if(!guildId || !BETA_TESTING_CMDS.includes(cmd)) return false;
+  const cfg = betaTestingConfigs.get(guildId);
+  if(!cfg || !cfg.channelIds.includes(channelId)) return false;
+  const tester = cfg.testers.get(userId);
+  if(!tester) return false;
+  if(tester.expiresAt !== null && tester.expiresAt <= Date.now()){ cfg.testers.delete(userId); return false; }
+  return true;
+}
 const GRANTABLE_OWNER_FEATURES = [
   { id:"quote_review", label:"Quote Review — accept/deny submissions" },
+  { id:"reaction_bomb", label:"Reaction Bomb — right-click message context command" },
+  { id:"clank_this", label:"Clank This — right-click message context command" },
+  { id:"expose", label:"Expose — right-click message context command" },
+  { id:"quote_manager", label:"Quote Manager — browse & delete quote images" },
 ];
 const TEMPOWNER_DURATIONS = [
   { label:"15 minutes",  value:"15" },
@@ -558,6 +592,62 @@ function buildTempOwnerPanel(token){
     ``,
     `**📋 Current grants:**`,
     formatGrantsList(),
+  ].join("\n");
+
+  return { content, components: rows };
+}
+
+// ── /blacklist — interactive picker ─────────────────────────────────────────
+// Replaces the old all-or-nothing blacklist: an owner can block a user from
+// specific commands, or hit "Full Blacklist" for the old block-everything
+// behavior (still backed by the same featureBlacklist data, just with "all"
+// in the feature set). Mirrors the /tempowner builder UI.
+const blacklistBuilders = new Map(); // token -> { ownerId, targetUserId, features:Set<string>, silent:boolean }
+
+function formatBlacklistList(){
+  if(featureBlacklist.size === 0) return "_No users are currently blacklisted._";
+  const lines = [];
+  for(const [id, b] of featureBlacklist.entries()){
+    const featsText = b.features.has("all") ? "**🚫 Full blacklist**" : [...b.features].map(f=>`\`/${f}\``).join(" ");
+    lines.push(`<@${id}> — ${featsText}${b.silent ? " 🔇 *silent*" : ""}`);
+  }
+  return lines.join("\n");
+}
+
+function buildBlacklistPanel(token){
+  const b = blacklistBuilders.get(token);
+  const cmdNames = buildGuildCommands().map(c => c.name).sort();
+  const isAll = b.features.has("all");
+  const specificFeatures = new Set([...b.features].filter(f => f !== "all"));
+
+  const { rows: selectRows } = buildTicketPickerRows({
+    items: cmdNames.map(n => ({ label: `/${n}`, value: n })),
+    idPrefix: `bl_sel_${token}`,
+    selectedIds: [...specificFeatures],
+    mode: "multi",
+    placeholder: isAll ? "Full blacklist active — pick to override…" : "Commands to block…",
+  });
+
+  const rows = [
+    ...selectRows,
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`bl_all_${token}`).setLabel(isAll ? "🚫 Full Blacklist ✓" : "🚫 Full Blacklist").setStyle(isAll ? "DANGER" : "SECONDARY"),
+      new MessageButton().setCustomId(`bl_silent_${token}`).setLabel(b.silent ? "🔇 Silent ✓" : "🔇 Silent").setStyle(b.silent ? "PRIMARY" : "SECONDARY"),
+      new MessageButton().setCustomId(`bl_save_${token}`).setLabel("✅ Save").setStyle("SUCCESS").setDisabled(!isAll && specificFeatures.size===0),
+      new MessageButton().setCustomId(`bl_clear_${token}`).setLabel("🗑️ Remove Entry").setStyle("DANGER").setDisabled(!featureBlacklist.has(b.targetUserId)),
+      new MessageButton().setCustomId(`bl_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+
+  const featsPreview = isAll ? "**🚫 Full blacklist**" : (specificFeatures.size ? [...specificFeatures].map(f=>`\`/${f}\``).join(" ") : "_none selected_");
+  const content = [
+    `🚫 **Blacklist** — configuring for <@${b.targetUserId}>`,
+    ``,
+    `**Blocked:** ${featsPreview}`,
+    `**Silent:** ${b.silent ? "🔇 Yes" : "No"}`,
+    ``,
+    `**📋 Currently blacklisted:**`,
+    formatBlacklistList(),
   ].join("\n");
 
   return { content, components: rows };
@@ -630,6 +720,43 @@ async function ensureDmRelayChannel(user) {
     return channel;
   } catch (e) {
     console.error("ensureDmRelayChannel error:", e.message);
+    return null;
+  }
+}
+
+// ── /thecount — queue messages in a hub channel, flush them all with /send ──
+// Reuses the same hub guild (dmRelayGuildId) as DM relay, but under its own
+// "The Count" category so queued messages stay clearly separate from live relays.
+const theCountChannels = new Map(); // userId -> { channelId, lastSentMessageId }
+async function ensureTheCountChannel(user) {
+  if (!dmRelayGuildId) return null;
+  const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+  if (!hubGuild) return null;
+
+  const existing = theCountChannels.get(user.id);
+  if (existing) {
+    const existingChannel = hubGuild.channels.cache.get(existing.channelId);
+    if (existingChannel) return existingChannel;
+    // stale entry (channel deleted) — fall through and recreate
+  }
+
+  try {
+    let category = hubGuild.channels.cache.find(c => c.type === "GUILD_CATEGORY" && c.name === "The Count");
+    if (!category) category = await hubGuild.channels.create("The Count", { type: "GUILD_CATEGORY" }).catch(() => null);
+
+    const channelName = user.username.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 90) || `user-${user.id}`;
+    const channel = await hubGuild.channels.create(channelName, {
+      type: "GUILD_TEXT",
+      parent: category ? category.id : undefined,
+      topic: `Queued messages for ${user.tag} (${user.id}) — nothing sent here reaches them until /send is run.`,
+    });
+
+    theCountChannels.set(user.id, { channelId: channel.id, lastSentMessageId: null });
+    saveData();
+    await channel.send(`📥 Messages sent here for **${user.tag}** are queued, not delivered. Run \`/send\` when ready to deliver everything queued across every channel in this category.`).catch(() => {});
+    return channel;
+  } catch (e) {
+    console.error("ensureTheCountChannel error:", e.message);
     return null;
   }
 }
@@ -1206,6 +1333,8 @@ function buildDataObject() {
     autoRoles:        [...autoRoles.entries()],
     shadowDelete: [...shadowDelete.entries()],
     clankerify:   [...clankerify.entries()],
+    theCountChannels: [...theCountChannels.entries()],
+    betaTestingConfigs: [...betaTestingConfigs.entries()].map(([gid,c]) => [gid, { categoryId:c.categoryId, channelIds:c.channelIds, testers:[...c.testers.entries()] }]),
     reactionRoles:    [...reactionRoles.entries()],
     disabledOwnerMsg: [...disabledOwnerMsg],
     disabledLevelUp:  [...disabledLevelUp],
@@ -1213,8 +1342,7 @@ function buildDataObject() {
     ytConfig:         [...ytConfig.entries()],
     countingChannels: [...countingChannels.entries()],
     userInstalls:     [...userInstalls],
-    blacklistedUsers: [...blacklistedUsers],
-    silentBlacklistUsers: [...silentBlacklistUsers],
+    featureBlacklist: [...featureBlacklist.entries()].map(([id,b]) => [id, [...b.features], b.silent]),
     // Temp/permanent owner grants — expiresAt:null means permanent, so it must survive restarts
     tempOwnerGrants:  [...tempOwnerGrants.entries()].map(([id,g]) => [id, { commands:[...g.commands], features:[...g.features], expiresAt:g.expiresAt, grantedBy:g.grantedBy, grantedAt:g.grantedAt }]),
     scores:           [...scores.entries()],
@@ -1304,6 +1432,10 @@ function loadData() {
         if (v.expiresAt === null || v.expiresAt > now) clankerify.set(k, v);
       });
     }
+    if (data.theCountChannels) data.theCountChannels.forEach(([k,v]) => theCountChannels.set(k, v));
+    if (data.betaTestingConfigs) data.betaTestingConfigs.forEach(([gid,c]) => {
+      betaTestingConfigs.set(gid, { categoryId:c.categoryId, channelIds:c.channelIds, testers: new Map(c.testers) });
+    });
     if (data.autoRoles)        data.autoRoles       .forEach(([k,v]) => autoRoles.set(k, v));
     if (data.reactionRoles)    data.reactionRoles   .forEach(([k,v]) => reactionRoles.set(k, v));
     if (data.disabledOwnerMsg) data.disabledOwnerMsg.forEach(v => disabledOwnerMsg.add(v));
@@ -1313,8 +1445,13 @@ function loadData() {
     if (data.ytConfig)         data.ytConfig         .forEach(([k,v]) => ytConfig.set(k, v));
     if (data.countingChannels) data.countingChannels  .forEach(([k,v]) => countingChannels.set(k, v));
     if (data.userInstalls)     data.userInstalls    .forEach(v => userInstalls.add(v));
-    if (data.blacklistedUsers) data.blacklistedUsers.forEach(v => blacklistedUsers.add(v));
-    if (data.silentBlacklistUsers) data.silentBlacklistUsers.forEach(v => silentBlacklistUsers.add(v));
+    if (data.featureBlacklist) {
+      data.featureBlacklist.forEach(([id, feats, silent]) => featureBlacklist.set(id, { features: new Set(feats), silent: !!silent }));
+    }
+    // Legacy data migration — old all-or-nothing blacklist format
+    if (data.blacklistedUsers) data.blacklistedUsers.forEach(id => {
+      if(!featureBlacklist.has(id)) featureBlacklist.set(id, { features: new Set(["all"]), silent: (data.silentBlacklistUsers||[]).includes(id) });
+    });
     if (data.tempOwnerGrants) {
       data.tempOwnerGrants.forEach(([id, g]) => {
         const grant = {
@@ -1896,6 +2033,15 @@ async function safeReply(interaction, payload) {
     // errors — these happen when Discord's 3-second window has expired.
     if(e?.code !== 10062 && !e?.message?.includes("already been acknowledged")){
       console.error("[safeReply error]", e?.message);
+      // Last-resort fallback: if reply() threw before acknowledging at all (e.g. a
+      // client-side payload validation error), defer + show a visible error instead
+      // of leaving Discord's "thinking…" spinner stuck forever with no follow-up.
+      if(!interaction.replied && !interaction.deferred){
+        try{
+          await interaction.deferReply({ephemeral:true}).catch(()=>{});
+          await interaction.editReply({content:"❌ Something went wrong building that response.",embeds:[],components:[]}).catch(()=>{});
+        }catch{}
+      }
     }
   }
 }
@@ -2532,7 +2678,7 @@ function buildTicketSetupStep(guild, guildId, stepOverride) {
     )];
   }
 
-  return { content: "", embeds: [embed], components };
+  return { embeds: [embed], components };
 }
 
 // ── YouTube helpers ───────────────────────────────────────────────────────────
@@ -3350,7 +3496,8 @@ const client=new Client({
 const OWNER_ONLY_CMDS = new Set([
   "servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds",
   "botstats","setstatus","adminconfig",
-  "shadowdelete","clankerify","forcemarry","forcedivorce","echo","paranoia",
+  "shadowdelete","clankerify","impersonation","forcemarry","forcedivorce","echo","paranoia",
+  "thecount","send","betatesting",
   "tempowner","blacklist","theremnant",
   // Owner context-menu commands
   "Reaction Bomb","Clank This","Expose",
@@ -3486,6 +3633,22 @@ function buildCommands(){
       {name:"user",     description:"Target user",                                             type:6, required:true},
       {name:"duration", description:"Duration in minutes (omit or 0 to disable)",              type:4, required:false},
     ]},
+    {name:"impersonation", description:"[Owner] Resend a user's messages via webhook as someone/something else", default_member_permissions:"0", options:[
+      {name:"user",     description:"Target user whose messages get intercepted",                 type:6, required:true},
+      {name:"as_user",  description:"Impersonate as this user's name/avatar (can't combine with pfp/name)", type:6, required:false},
+      {name:"pfp",      description:"Custom profile picture for the webhook (can't combine with as_user)",  type:11, required:false},
+      {name:"name",     description:"Custom display name for the webhook (can't combine with as_user)",     type:3, required:false},
+      {name:"mode",     description:"Clankerify mode to apply to messages",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"},{name:"Scottish",value:"scottish"}]},
+      {name:"duration", description:"Duration in minutes (omit for permanent, 0 to disable)",  type:4, required:false},
+    ]},
+    {name:"thecount", description:"[Owner] Open (or reuse) a queue channel for a user — nothing sent there reaches them until /send", default_member_permissions:"0", options:[
+      {name:"user", description:"User to open a queue channel for", type:6, required:true},
+    ]},
+    {name:"send", description:"[Owner] Deliver every queued message across all /thecount channels to their respective users", default_member_permissions:"0", options:[]},
+    {name:"betatesting", description:"[Owner] Grant a user access to run select owner commands in a controlled beta-testing category", default_member_permissions:"0", options:[
+      {name:"user",     description:"User to grant beta-testing access to",                     type:6, required:true},
+      {name:"duration", description:"Duration in minutes (omit for permanent, 0 to revoke)",   type:4, required:false},
+    ]},
     {name:"selfclank",  description:"Self-clankerify yourself for 1–5 minutes (0 to cancel, 2 people per server at a time)",options:[
       {name:"duration", description:"Duration in minutes (1–5), or 0 to cancel early",type:4,required:true},
     ]},
@@ -3582,14 +3745,8 @@ function buildCommands(){
     {name:"tempowner", description:"[Owner] Grant a user temporary or permanent owner access via an interactive picker",options:[
       {name:"user",       description:"User to grant access to (leave blank to just view current grants)",type:6,required:false},
     ]},
-    {name:"blacklist", description:"[Owner] Block a user from ever using RoyalBot",options:[
-      {name:"action",description:"What to do",type:3,required:true,choices:[
-        {name:"Add",   value:"add"},
-        {name:"Remove",value:"remove"},
-        {name:"List",  value:"list"},
-      ]},
-      {name:"user",description:"User to blacklist / unblacklist",type:6,required:false},
-      {name:"silent",description:"Add only: completely silent block — no DM, no reactions, no messages of any kind (default: false)",type:5,required:false},
+    {name:"blacklist", description:"[Owner] Block a user from specific commands/features via an interactive picker",options:[
+      {name:"user",description:"User to configure (leave blank to just view current blacklist)",type:6,required:false},
     ]},
     {name:"theremnant", description:"[Owner] Send a mysterious dimensional transmission to this channel",options:[
       {name:"message",description:"The text to transmit",type:3,required:true,max_length:1000},
@@ -4011,7 +4168,7 @@ client.on("messageReactionRemove", async (reaction, user) => {
 // ── DM forwarding ──────────────────────────────────────────────────────────────
 client.on("messageCreate", async msg => {
   if (msg.author.bot) return;
-  if (blacklistedUsers.has(msg.author.id)) return; // blacklisted — ignore DMs entirely
+  if (isFullyBlacklisted(msg.author.id)) return; // blacklisted — ignore DMs entirely
   if (msg.guild) {
     // guild messages handled below
   } else {
@@ -4070,8 +4227,8 @@ client.on("messageCreate",async msg=>{
   if(msg.author.bot||!msg.guild)return;
 
   // ── Blacklist — blocks all guild message-based features ────────────────────
-  if(blacklistedUsers.has(msg.author.id)){
-    if(countingChannels.has(msg.channelId) && !silentBlacklistUsers.has(msg.author.id)){
+  if(isFullyBlacklisted(msg.author.id)){
+    if(countingChannels.has(msg.channelId) && !isSilentBlacklisted(msg.author.id)){
       await safeSend(msg.channel,`${msg.author} is blacklisted from RoyalBot and cannot count, ignore this message`);
     }
     return;
@@ -4081,8 +4238,8 @@ client.on("messageCreate",async msg=>{
   if(msg.guildId === dmRelayGuildId){
     const relayUserId = dmRelayChannelsByChannel.get(msg.channelId);
     if(relayUserId){
-      if(blacklistedUsers.has(relayUserId)){
-        if(!silentBlacklistUsers.has(relayUserId)) await msg.react("🚫").catch(() => {});
+      if(isFullyBlacklisted(relayUserId)){
+        if(!isSilentBlacklisted(relayUserId)) await msg.react("🚫").catch(() => {});
         return; // blacklisted — don't relay outgoing messages to their DMs either
       }
       try{
@@ -4136,9 +4293,21 @@ client.on("messageCreate",async msg=>{
 
         await msg.delete().catch(()=>{});
 
-        const member    = await msg.guild.members.fetch(msg.author.id).catch(()=>null);
-        let displayName = member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
-        let avatarURL   = msg.author.displayAvatarURL({ size: 256, dynamic: true });
+        const member = await msg.guild.members.fetch(msg.author.id).catch(()=>null);
+        const originalName = member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
+        const originalAvatarURL = msg.author.displayAvatarURL({ size: 256, dynamic: true });
+
+        // ── Persona override (set by /impersonation — plain /clankerify and /selfclank never set these) ──
+        let displayName, avatarURL;
+        if(clankEntry.impersonateAsUserId){
+          const asUser   = await client.users.fetch(clankEntry.impersonateAsUserId).catch(()=>null);
+          const asMember = asUser ? await msg.guild.members.fetch(asUser.id).catch(()=>null) : null;
+          displayName = asMember?.displayName || asUser?.displayName || asUser?.globalName || asUser?.username || originalName;
+          avatarURL   = asUser?.displayAvatarURL({ size: 256, dynamic: true }) || originalAvatarURL;
+        } else {
+          displayName = clankEntry.impersonateName || originalName;
+          avatarURL   = clankEntry.impersonateAvatarURL || originalAvatarURL;
+        }
         let sendContent = content;
 
         // ── Mode transforms ────────────────────────────────────────────────────
@@ -4801,7 +4970,7 @@ client.on("messageCreate",async msg=>{
         // ── Custom mode (built with /clankerbuild) — must run BEFORE sendOpts is built ──
         if(mode && customClankerModes.has(mode)){
           const cm = customClankerModes.get(mode);
-          const rawName = member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
+          const rawName = displayName;
           displayName = (cm.displayNameFormat || "{name}").replace("{name}", rawName);
           if(sendContent){
             let t = sendContent;
@@ -4963,8 +5132,8 @@ client.on("interactionCreate",async interaction=>{
   if(!instanceLocked)return;
 
   // ── Blacklist — blocks ALL interactions (commands, buttons, menus) ─────────
-  if(interaction.user && blacklistedUsers.has(interaction.user.id)){
-    if(!silentBlacklistUsers.has(interaction.user.id)){
+  if(interaction.user && isFullyBlacklisted(interaction.user.id)){
+    if(!isSilentBlacklisted(interaction.user.id)){
       try{
         const payload={content:`❌ <@${interaction.user.id}> is blacklisted from RoyalBot and cannot use this bot.`,ephemeral:true};
         if(interaction.deferred||interaction.replied) await interaction.followUp(payload).catch(()=>{});
@@ -5220,6 +5389,107 @@ client.on("interactionCreate",async interaction=>{
           ].join("\n"));
         }
       }catch(e){ console.warn("[tempowner] DM failed:", e.message); }
+
+      return;
+    }
+
+    // ── /blacklist interactive panel: selects, toggles, save, clear, cancel ────
+    if(cid.startsWith("bl_sel_")||cid.startsWith("bl_all_")||cid.startsWith("bl_silent_")||cid.startsWith("bl_save_")||cid.startsWith("bl_clear_")||cid.startsWith("bl_cancel_")){
+      let token;
+      const blSelMatch = cid.match(/^bl_sel_(.+)_(\d+)$/);
+      if(blSelMatch) token = blSelMatch[1];
+      else if(cid.startsWith("bl_all_")) token = cid.slice(7);
+      else if(cid.startsWith("bl_silent_")) token = cid.slice(10);
+      else if(cid.startsWith("bl_save_")) token = cid.slice(8);
+      else if(cid.startsWith("bl_clear_")) token = cid.slice(9);
+      else if(cid.startsWith("bl_cancel_")) token = cid.slice(10);
+
+      const b = blacklistBuilders.get(token);
+      if(!b){ try{await interaction.reply({content:"❌ This panel has expired — run `/blacklist` again.",ephemeral:true});}catch{} return; }
+      if(b.ownerId !== uid){ try{await interaction.reply({content:"❌ Only the owner who ran this command can use this panel.",ephemeral:true});}catch{} return; }
+
+      if(blSelMatch){
+        const cmdNames = buildGuildCommands().map(c=>c.name).sort();
+        const chunk = chunkArray(cmdNames.map(n=>({value:n})),25)[Number(blSelMatch[2])] || [];
+        const merged = mergeChunkedSelection([...b.features].filter(f=>f!=="all"), chunk, interaction.values);
+        b.features = new Set(merged); // picking specific commands exits "Full Blacklist" mode
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_all_")){
+        b.features = b.features.has("all") ? new Set() : new Set(["all"]);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_silent_")){
+        b.silent = !b.silent;
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply(buildBlacklistPanel(token)); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_cancel_")){
+        blacklistBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:"❌ Cancelled.",components:[]}); }catch{}
+        return;
+      }
+
+      if(cid.startsWith("bl_clear_")){
+        featureBlacklist.delete(b.targetUserId);
+        saveDataAndCommitNow().catch(()=>{});
+        blacklistBuilders.delete(token);
+        if(!(await btnAck(interaction))) return;
+        try{ await interaction.editReply({content:`✅ <@${b.targetUserId}> removed from the blacklist entirely.`,components:[]}); }catch{}
+        return;
+      }
+
+      // bl_save_
+      if(b.features.size===0){
+        try{await interaction.reply({content:"❌ Pick at least one command, or Full Blacklist, first.",ephemeral:true});}catch{}
+        return;
+      }
+      if(OWNER_IDS.includes(b.targetUserId)){
+        try{await interaction.reply({content:"❌ Can't blacklist an owner.",ephemeral:true});}catch{}
+        return;
+      }
+      if(!(await btnAck(interaction))) return;
+
+      const wasFullyBlacklisted = isFullyBlacklisted(b.targetUserId);
+      featureBlacklist.set(b.targetUserId, { features: new Set(b.features), silent: b.silent });
+      saveDataAndCommitNow().catch(()=>{});
+      blacklistBuilders.delete(token);
+
+      const isAllNow = b.features.has("all");
+      const featsText = isAllNow ? "**🚫 Full blacklist**" : [...b.features].map(f=>`\`/${f}\``).join(" ");
+
+      try{
+        await interaction.editReply({
+          content:`✅ <@${b.targetUserId}> blacklist updated.\n**Blocked:** ${featsText}${b.silent?"\n🔇 Silent mode.":""}\n\n**📋 Currently blacklisted:**\n${formatBlacklistList()}`,
+          components:[],
+        });
+      }catch{}
+
+      // Only notify + cut the DM relay on a fresh transition into full blacklist, matching the old add-only notify behavior
+      if(isAllNow && !wasFullyBlacklisted && !b.silent){
+        try {
+          const targetUser = await client.users.fetch(b.targetUserId).catch(()=>null);
+          if(targetUser){
+            const dm = await targetUser.createDM();
+            await dm.send("You've been blacklisted.");
+          }
+          const relayChannelId = dmRelayChannels.get(b.targetUserId);
+          if(relayChannelId){
+            const hubGuild = dmRelayGuildId ? client.guilds.cache.get(dmRelayGuildId) : null;
+            const relayChannel = hubGuild ? hubGuild.channels.cache.get(relayChannelId) : null;
+            if(relayChannel) await relayChannel.send("🚫 This user has been blacklisted — DMs no longer relay through this channel.").catch(()=>{});
+          }
+        } catch(e) { console.error("[blacklist] notify failed:", e.message); }
+      }
 
       return;
     }
@@ -5918,7 +6188,7 @@ client.on("interactionCreate",async interaction=>{
 
     // ── Quote manager navigation & delete buttons ─────────────────────────────
     if(cid.startsWith("qm_")){
-      if(!OWNER_IDS.includes(uid)){ await btnEphemeral(interaction,"Owner only."); return; }
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"quote_manager")){ await btnEphemeral(interaction,"Owner only."); return; }
 
       // Delete button: qm_delete_{filename}
       if(cid.startsWith("qm_delete_")){
@@ -6179,7 +6449,7 @@ client.on("interactionCreate",async interaction=>{
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
         {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist action:add|remove|list [user] [silent]` — Block a user from ever using RoyalBot","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/betatesting user:… [duration]` — Grant channel-scoped access to select owner commands in a dedicated category","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const p=HELP_PAGES[page];
       const navRow=new MessageActionRow().addComponents(
@@ -6851,7 +7121,7 @@ client.on("interactionCreate",async interaction=>{
     if(cid === "theremnant_modal"){
       const replyText = (interaction.fields.getTextInputValue("remnant_reply")||"").trim();
       if(!replyText) return safeReply(interaction,{content:"❌ Message can't be empty.",ephemeral:true});
-      if(blacklistedUsers.has(uid)) return silentBlacklistUsers.has(uid) ? undefined : safeReply(interaction,{content:"❌ You can't do that.",ephemeral:true});
+      if(isFullyBlacklisted(uid)) return isSilentBlacklisted(uid) ? undefined : safeReply(interaction,{content:"❌ You can't do that.",ephemeral:true});
 
       try{
         const relayChannel = await ensureDmRelayChannel(interaction.user);
@@ -7011,7 +7281,7 @@ client.on("interactionCreate",async interaction=>{
 
     // ── Reaction Bomb (owner only) ───────────────────────────────────────────────
     if(cmd === "Reaction Bomb"){
-      if(!OWNER_IDS.includes(uid)) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"reaction_bomb")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
       const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
       try {
         await interaction.deferReply({ephemeral:true});
@@ -7025,7 +7295,7 @@ client.on("interactionCreate",async interaction=>{
 
     // ── Clank This (owner only) ─────────────────────────────────────────────────
     if(cmd === "Clank This"){
-      if(!OWNER_IDS.includes(uid)) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"clank_this")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
       const target = targetMsg.author;
       if(target.bot) return safeReply(interaction,{content:"Can't clankerify a bot.",ephemeral:true});
       clankerify.set(target.id, { expiresAt: Date.now() + 10 * 60_000, mode: null, ownerClanked: true });
@@ -7036,7 +7306,7 @@ client.on("interactionCreate",async interaction=>{
 
     // ── Expose (owner only) ─────────────────────────────────────────────────────
     if(cmd === "Expose"){
-      if(!OWNER_IDS.includes(uid)) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+      if(!OWNER_IDS.includes(uid) && !hasTempOwnerFeature(uid,"expose")) return safeReply(interaction,{content:"Owner only.",ephemeral:true});
       const content = targetMsg.content || "(no text)";
       const author = targetMsg.author;
       const exposePrefixes = [
@@ -7215,14 +7485,20 @@ client.on("interactionCreate",async interaction=>{
   const cmd=interaction.commandName;
   const inGuild=!!interaction.guildId;
 
-  const ownerOnly=["servers","requester","deleter","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","echo","shadowdelete","clankerify","fakemessage","fakequote","forcemarry","forcedivorce","paranoia","tempowner","blacklist","theremnant"];
-  if(ownerOnly.includes(cmd)&&!isEffectiveOwner(interaction.user.id, cmd))return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+  const ownerOnly=["servers","requester","deleter","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","echo","shadowdelete","clankerify","impersonation","thecount","send","fakemessage","fakequote","forcemarry","forcedivorce","paranoia","tempowner","blacklist","theremnant","betatesting"];
+  if(ownerOnly.includes(cmd)&&!isEffectiveOwner(interaction.user.id, cmd)&&!isBetaTesterAllowed(interaction.user.id, interaction.guildId, interaction.channelId, cmd))return safeReply(interaction,{content:"Owner only.",ephemeral:true});
 
   const manageServerCmds=["channelpicker","counting","xpconfig","setwelcome","setleave","setwelcomemsg","setleavemsg","disableownermsg","serverconfig","autorole","setboostmsg","invitecomp","purge","reactionrole","ticketsetup","ytsetup","subgoal","subcount","milestones","dailyquote","serverstats"];
   if(manageServerCmds.includes(cmd)){
     if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
     if(!OWNER_IDS.includes(interaction.user.id)&&!interaction.member.permissions.has("MANAGE_GUILD"))
       return safeReply(interaction,{content:"❌ You need **Manage Server** permission.",ephemeral:true});
+  }
+
+  // ── Granular blacklist — per-command block (full blacklist already handled above) ──
+  if(isFeatureBlacklisted(interaction.user.id, cmd)){
+    if(!isSilentBlacklisted(interaction.user.id)) return safeReply(interaction,{content:`❌ You've been blocked from using \`/${cmd}\`.`,ephemeral:true});
+    return;
   }
 
   // ── Auto-defer safety net ────────────────────────────────────────────────────
@@ -7441,53 +7717,28 @@ if(cmd==="tempowner"){
 }
 
 if(cmd==="blacklist"){
-  const action = interaction.options.getString("action");
   const targetUser = interaction.options.getUser("user");
-  const silent = interaction.options.getBoolean("silent") || false;
 
-  if(action==="list"){
-    if(blacklistedUsers.size===0) return safeReply(interaction,{content:"No users are currently blacklisted.",ephemeral:true});
-    return safeReply(interaction,{content:`🚫 **Blacklisted users:**\n${[...blacklistedUsers].map(id=>`<@${id}> (\`${id}\`)${silentBlacklistUsers.has(id)?" 🔇 *silent*":""}`).join("\n")}`,ephemeral:true});
+  if(!targetUser){
+    return safeReply(interaction,{
+      content:[`🚫 **Blacklist — Current Entries**`,``,formatBlacklistList()].join("\n"),
+      ephemeral:true,
+    });
   }
+  if(OWNER_IDS.includes(targetUser.id))
+    return safeReply(interaction,{content:"❌ Can't blacklist an owner.",ephemeral:true});
 
-  if(!targetUser) return safeReply(interaction,{content:"You need to specify a user for this action.",ephemeral:true});
+  const token = `${interaction.user.id.slice(-6)}${Date.now().toString(36)}`;
+  const existing = featureBlacklist.get(targetUser.id);
+  blacklistBuilders.set(token, {
+    ownerId: interaction.user.id,
+    targetUserId: targetUser.id,
+    features: new Set(existing?.features ?? []),
+    silent: existing?.silent ?? false,
+  });
+  setTimeout(()=>blacklistBuilders.delete(token), 10*60*1000);
 
-  if(action==="add"){
-    if(OWNER_IDS.includes(targetUser.id)) return safeReply(interaction,{content:"❌ Can't blacklist an owner.",ephemeral:true});
-    if(blacklistedUsers.has(targetUser.id)) return safeReply(interaction,{content:`<@${targetUser.id}> is already blacklisted.`,ephemeral:true});
-    blacklistedUsers.add(targetUser.id);
-    if(silent) silentBlacklistUsers.add(targetUser.id); else silentBlacklistUsers.delete(targetUser.id);
-    saveDataAndCommitNow().catch(()=>{});
-
-    if(!silent){
-      // Notify them, then cut off their relay channel — all further DMs (either direction) are ignored from here on.
-      try {
-        const dm = await targetUser.createDM();
-        await dm.send("You've been blacklisted.");
-      } catch(e) { console.error("[blacklist] DM notify failed:", e.message); }
-
-      const relayChannelId = dmRelayChannels.get(targetUser.id);
-      if(relayChannelId){
-        try{
-          const hubGuild = dmRelayGuildId ? client.guilds.cache.get(dmRelayGuildId) : null;
-          const relayChannel = hubGuild ? hubGuild.channels.cache.get(relayChannelId) : null;
-          if(relayChannel) await relayChannel.send("🚫 This user has been blacklisted — DMs no longer relay through this channel.").catch(()=>{});
-        } catch(e) { console.error("[blacklist] relay notice failed:", e.message); }
-      }
-    }
-
-    return safeReply(interaction,{content:`🚫 <@${targetUser.id}> has been blacklisted from RoyalBot. They can no longer use any command or feature of the bot.${silent?"\n🔇 Silent mode — they will receive no notice or messages of any kind, ever, about this.":""}`,ephemeral:true});
-  }
-
-  if(action==="remove"){
-    if(!blacklistedUsers.has(targetUser.id)) return safeReply(interaction,{content:`<@${targetUser.id}> is not blacklisted.`,ephemeral:true});
-    blacklistedUsers.delete(targetUser.id);
-    silentBlacklistUsers.delete(targetUser.id);
-    saveDataAndCommitNow().catch(()=>{});
-    return safeReply(interaction,{content:`✅ <@${targetUser.id}> has been removed from the blacklist.`,ephemeral:true});
-  }
-
-  return;
+  return safeReply(interaction,{...buildBlacklistPanel(token), ephemeral:true});
 }
 
 if(cmd==="theremnant"){
@@ -7599,6 +7850,164 @@ if(cmd==="clankerify"){
     content:`🤖 Clankerifying <@${target.id}> ${durationStr}. Pick a mode:`,
     components: clankerifyComponents,
     ephemeral:true
+  });
+}
+
+if(cmd==="impersonation"){
+  const target   = interaction.options.getUser("user");
+  const asUser   = interaction.options.getUser("as_user");
+  const pfp      = interaction.options.getAttachment("pfp");
+  const name     = interaction.options.getString("name");
+  const modeOpt  = interaction.options.getString("mode");
+  const duration = interaction.options.getInteger("duration") ?? null; // minutes, null = permanent
+
+  if(target.bot) return safeReply(interaction,{content:"❌ Can't impersonate a bot's messages.",ephemeral:true});
+  if(asUser && (pfp || name))
+    return safeReply(interaction,{content:"❌ `as_user` can't be combined with `pfp`/`name` — pick one approach.",ephemeral:true});
+
+  // duration === 0 means disable
+  if(duration === 0){
+    clankerify.delete(target.id);
+    saveData();
+    return safeReply(interaction,{content:`✅ Impersonation **disabled** for <@${target.id}>.`,ephemeral:true});
+  }
+
+  const mode = (modeOpt && modeOpt !== "none") ? modeOpt : null;
+  const expiresAt = duration ? Date.now() + duration*60000 : null;
+
+  clankerify.set(target.id, {
+    expiresAt,
+    mode,
+    ownerClanked: true,
+    impersonateAsUserId: asUser ? asUser.id : null,
+    impersonateName: name || null,
+    impersonateAvatarURL: pfp ? pfp.url : null,
+  });
+  saveData();
+
+  const personaDesc = asUser
+    ? `as <@${asUser.id}>`
+    : (name || pfp) ? `as **${name || "(their own name)"}**${pfp ? " with a custom pfp" : ""}` : "as themselves (no persona set)";
+  const durationStr2 = duration ? `**${duration} minute(s)**` : "**permanently**";
+  return safeReply(interaction,{
+    content:`🎭 Impersonating <@${target.id}>'s messages ${personaDesc} for ${durationStr2}${mode?` (mode: **${mode}**)`:""}.`,
+    ephemeral:true,
+  });
+}
+
+if(cmd==="thecount"){
+  const target = interaction.options.getUser("user");
+  if(target.bot) return safeReply(interaction,{content:"❌ Can't open a queue channel for a bot.",ephemeral:true});
+  if(!dmRelayGuildId) return safeReply(interaction,{content:"❌ No DM hub server configured yet — run `/dmconfig` first.",ephemeral:true});
+
+  const channel = await ensureTheCountChannel(target);
+  if(!channel) return safeReply(interaction,{content:"❌ Couldn't create/open the queue channel — check the hub server still exists and the bot has permission there.",ephemeral:true});
+
+  return safeReply(interaction,{content:`📥 Queue channel ready: <#${channel.id}>. Anything sent there waits until \`/send\` is run.`,ephemeral:true});
+}
+
+if(cmd==="send"){
+  await interaction.deferReply({ephemeral:true});
+  if(!dmRelayGuildId) return safeReply(interaction,{content:"❌ No DM hub server configured.",ephemeral:true});
+  const hubGuild = client.guilds.cache.get(dmRelayGuildId);
+  if(!hubGuild) return safeReply(interaction,{content:"❌ Hub server not found.",ephemeral:true});
+  if(theCountChannels.size===0) return safeReply(interaction,{content:"Nothing queued — no `/thecount` channels exist yet.",ephemeral:true});
+
+  let totalSent=0, totalFailed=0, channelsProcessed=0;
+  const summary=[];
+
+  for(const [userId, entry] of theCountChannels.entries()){
+    const channel = hubGuild.channels.cache.get(entry.channelId);
+    if(!channel) continue;
+
+    let fetched;
+    try{
+      fetched = entry.lastSentMessageId
+        ? await channel.messages.fetch({ after: entry.lastSentMessageId, limit: 100 })
+        : await channel.messages.fetch({ limit: 100 });
+    }catch(e){ console.error("[send] fetch error:", e.message); continue; }
+
+    const pending = [...fetched.values()]
+      .filter(m => !m.author.bot)
+      .sort((a,b) => a.createdTimestamp - b.createdTimestamp);
+
+    if(pending.length===0) continue;
+
+    const targetUser = await client.users.fetch(userId).catch(()=>null);
+    let sentHere=0, failedHere=0, newestId=entry.lastSentMessageId;
+
+    for(const m of pending){
+      newestId = m.id;
+      const files = m.attachments.size > 0 ? [...m.attachments.values()].map(a=>a.url) : undefined;
+      if(!m.content && !files) continue;
+      try{
+        if(!targetUser) throw new Error("user not found");
+        const dm = await targetUser.createDM();
+        await dm.send({ content: m.content || undefined, files });
+        await m.react("✅").catch(()=>{});
+        sentHere++;
+      }catch(e){
+        await m.react("❌").catch(()=>{});
+        failedHere++;
+      }
+    }
+
+    entry.lastSentMessageId = newestId;
+    totalSent += sentHere;
+    totalFailed += failedHere;
+    if(sentHere || failedHere){ channelsProcessed++; summary.push(`<#${channel.id}> → <@${userId}>: ${sentHere} sent${failedHere?`, ${failedHere} failed`:""}`); }
+  }
+
+  saveData();
+
+  if(channelsProcessed===0) return safeReply(interaction,{content:"Nothing new to send — every queue channel is already flushed.",ephemeral:true});
+
+  return safeReply(interaction,{
+    content:[`📤 **Sent.** ${totalSent} message(s) delivered${totalFailed?`, ${totalFailed} failed (DMs likely closed)`:""} across ${channelsProcessed} channel(s).`,``,...summary].join("\n").slice(0,1900),
+    ephemeral:true,
+  });
+}
+
+if(cmd==="betatesting"){
+  if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
+  const target = interaction.options.getUser("user");
+  const duration = interaction.options.getInteger("duration") ?? null; // minutes, null = permanent
+  const guildId = interaction.guildId;
+  const guild = interaction.guild;
+
+  let cfg = betaTestingConfigs.get(guildId);
+
+  if(duration === 0){
+    if(cfg) cfg.testers.delete(target.id);
+    saveData();
+    return safeReply(interaction,{content:`✅ Beta-testing access revoked for <@${target.id}>.`,ephemeral:true});
+  }
+  if(target.bot) return safeReply(interaction,{content:"❌ Can't grant beta-testing access to a bot.",ephemeral:true});
+  if(OWNER_IDS.includes(target.id)) return safeReply(interaction,{content:"❌ They're already an owner.",ephemeral:true});
+
+  // Create the category + 2 channels once per guild; reused on every later /betatesting run here
+  if(!cfg || !guild.channels.cache.has(cfg.categoryId)){
+    try{
+      const category = await guild.channels.create("🧪 Beta Testing", { type: "GUILD_CATEGORY" });
+      const ch1 = await guild.channels.create("beta-testing-1", { type:"GUILD_TEXT", parent: category.id });
+      const ch2 = await guild.channels.create("beta-testing-2", { type:"GUILD_TEXT", parent: category.id });
+      cfg = { categoryId: category.id, channelIds: [ch1.id, ch2.id], testers: new Map() };
+      betaTestingConfigs.set(guildId, cfg);
+    }catch(e){
+      console.error("[betatesting] category creation failed:", e.message);
+      return safeReply(interaction,{content:"❌ Couldn't create the beta-testing category — check the bot's permissions here.",ephemeral:true});
+    }
+  }
+
+  const expiresAt = duration ? Date.now() + duration*60000 : null;
+  cfg.testers.set(target.id, { expiresAt });
+  saveData();
+
+  const durationStr = duration ? `**${duration} minute(s)**` : "**permanently**";
+  const channelMentions = cfg.channelIds.map(id=>`<#${id}>`).join(" and ");
+  return safeReply(interaction,{
+    content:`🧪 <@${target.id}> can now use select owner commands (${BETA_TESTING_CMDS.map(c=>`\`/${c}\``).join(" ")}) in ${channelMentions} for ${durationStr}.`,
+    ephemeral:true,
   });
 }
 
@@ -7868,7 +8277,7 @@ if(cmd==="divorce"){
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
         {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist action:add|remove|list [user] [silent]` — Block a user from ever using RoyalBot","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/betatesting user:… [duration]` — Grant channel-scoped access to select owner commands in a dedicated category","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const TOTAL=HELP_PAGES.length;
       function buildHelpEmbed(page){
