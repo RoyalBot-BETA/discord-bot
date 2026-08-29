@@ -245,7 +245,26 @@
     ]
   ],
   "theCountChannels": [],
-  "betaTestingConfigs": [],
+  "betaTestingConfigs": [
+    [
+      "1533594455125397654",
+      {
+        "categoryId": "1543344966951116852",
+        "channelIds": [
+          "1543344968033112195",
+          "1543344968847065139"
+        ],
+        "testers": [
+          [
+            "1082452773787942922",
+            {
+              "expiresAt": null
+            }
+          ]
+        ]
+      }
+    ]
+  ],
   "reactionRoles": [
     [
       "1408975996715139084:1483218332005175427:🤖",
@@ -4902,7 +4921,7 @@
         "dailyStreak": 1,
         "bestStreak": 1,
         "lastDailyDate": "2026-04-27",
-        "xp": 3433,
+        "xp": 3446,
         "level": 28,
         "lastWorkTime": 0,
         "lastBegTime": 0,
@@ -6135,7 +6154,7 @@
         "dailyStreak": 0,
         "bestStreak": 0,
         "lastDailyDate": "",
-        "xp": 955,
+        "xp": 965,
         "level": 9,
         "lastWorkTime": 0,
         "lastBegTime": 0,
