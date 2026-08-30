@@ -42,7 +42,7 @@ const ffmpegPath = require("ffmpeg-static");
 })();
 
 const TOKEN     = process.env.TOKEN;
-const CLIENT_ID = "1533598420504412261";
+const CLIENT_ID = "1480592876684706064";
 const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
 const OWNER_ID  = OWNER_IDS[1];
 const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
@@ -504,23 +504,7 @@ function isEffectiveOwner(userId, commandName){
 }
 
 // ── /tempowner — interactive picker ─────────────────────────────────────────
-const GRANTABLE_OWNER_CMDS = ["servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant"];
-
-// ── /betatesting — channel-scoped owner command access ─────────────────────
-// Unlike /tempowner (global, any channel), access here only works inside the
-// beta-testing category's own channels. Excludes anything involving quote
-// deletion (deleter/requester/quote_review/quote_manager) or relay/hub setup (dmconfig).
-const BETA_TESTING_CMDS = ["servers","fakemessage","fakequote","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant"];
-const betaTestingConfigs = new Map(); // guildId -> { categoryId, channelIds:[id1,id2], testers: Map<userId,{expiresAt:number|null}> }
-function isBetaTesterAllowed(userId, guildId, channelId, cmd){
-  if(!guildId || !BETA_TESTING_CMDS.includes(cmd)) return false;
-  const cfg = betaTestingConfigs.get(guildId);
-  if(!cfg || !cfg.channelIds.includes(channelId)) return false;
-  const tester = cfg.testers.get(userId);
-  if(!tester) return false;
-  if(tester.expiresAt !== null && tester.expiresAt <= Date.now()){ cfg.testers.delete(userId); return false; }
-  return true;
-}
+const GRANTABLE_OWNER_CMDS = ["servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","shadowdelete","clankerify","impersonation","thecount","send","forcemarry","forcedivorce","echo","paranoia","theremnant","jarvisenhance"];
 const GRANTABLE_OWNER_FEATURES = [
   { id:"quote_review", label:"Quote Review — accept/deny submissions" },
   { id:"reaction_bomb", label:"Reaction Bomb — right-click message context command" },
@@ -651,6 +635,355 @@ function buildBlacklistPanel(token){
   ].join("\n");
 
   return { content, components: rows };
+}
+
+// ── /jarvisenhance — customizable Jarvis automation chains ─────────────────────
+// A "profile" is a named, owner-built macro: one or more trigger words (matched
+// the exact same way as the Jarvis image trigger — tokenized whole-word match,
+// not loose substring) plus an ordered list of actions to run in sequence
+// against the message being replied to when someone says "Jarvis, <word>" or
+// "RoyalBot, <word>" as a reply. Every action here is a real, existing owner
+// capability of the bot (Discord-side and coded-in) — this just lets them be
+// chained, reordered, and fired by voice-style command instead of typed one at
+// a time.
+// jarvisEnhanceProfiles: name -> { triggers:[word,...], actions:[{type,params}], creatorId, creatorName, createdAt }
+const jarvisEnhanceProfiles = new Map();
+// Seed the example from the spec — "Jarvis, clankerfy him" while replying picks
+// a random personality mode. Loaded save data (below) overwrites this if the
+// owner has since customized or deleted it.
+jarvisEnhanceProfiles.set("clankerfy", {
+  triggers: ["clankerfy", "clankerify", "clank"],
+  actions: [{ type:"clankerify", params:{ mode:"random", duration:"10" } }],
+  ownerLocked: true,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+// jarvisEnhanceBuilders: token -> { ownerId, name, triggers:[...], actions:[...], selectedStep:number|null, pendingActionType:string|null }
+const jarvisEnhanceBuilders = new Map();
+
+// Every action available to /jarvisenhance. `needs` tells the runner what
+// context the step requires: "user" = the author of the replied-to message,
+// "message" = the replied-to message itself, "channel" = just the channel the
+// trigger was said in. `fields` become a Discord modal (max 5 fields/modal;
+// every action here uses 0–2) when the owner adds that action to a profile.
+const JARVISENHANCE_ACTIONS = [
+  { id:"clankerify", emoji:"🤖", label:"Clankerify", needs:"user", fields:[
+    { key:"mode", label:"Mode (blank=none; random, evil, freaky, american, british, stupid, boomer, conspiracy, npc, sigma, medieval, ghost, pirate, rr_propaganda, french, uwu, or a /clankerbuild custom mode id)", style:2, required:false, max:60 },
+    { key:"duration", label:"Duration in minutes (blank=permanent, 0=disable)", style:1, required:false, max:10 },
+  ]},
+  { id:"impersonation", emoji:"🎭", label:"Impersonation", needs:"user", fields:[
+    { key:"mode", label:"Mode (blank=none; same options as Clankerify)", style:2, required:false, max:60 },
+    { key:"duration", label:"Duration in minutes (blank=permanent, 0=disable)", style:1, required:false, max:10 },
+  ]},
+  { id:"shadowdelete", emoji:"👻", label:"Shadow Delete", needs:"user", fields:[
+    { key:"percentage", label:"Delete chance % (0-100, 0=disable)", style:1, required:true, max:3 },
+  ]},
+  { id:"paranoia", emoji:"😱", label:"Paranoia (toggle)", needs:"user", fields:[
+    { key:"chance", label:"Reply chance % (1-100, blank=100)", style:1, required:false, max:3 },
+  ]},
+  { id:"clank_this", emoji:"⚡", label:"Quick Clank (10 min, plain)", needs:"user", fields:[] },
+  { id:"reaction_bomb", emoji:"💣", label:"Reaction Bomb", needs:"message", fields:[] },
+  { id:"expose", emoji:"🚨", label:"Expose", needs:"message", fields:[] },
+  { id:"jarvis_image", emoji:"🖼️", label:"Random Jarvis Image", needs:"message", fields:[] },
+  { id:"forcedivorce", emoji:"💔", label:"Force Divorce", needs:"user", fields:[] },
+  { id:"forcemarry", emoji:"💍", label:"Force Marry (to a 2nd user)", needs:"user", fields:[
+    { key:"user2", label:"Second user — @mention or user ID", style:1, required:true, max:40 },
+  ]},
+  { id:"fakequote", emoji:"🗨️", label:"Fake Quote Card", needs:"user", fields:[
+    { key:"text", label:"Quote text", style:2, required:true, max:300 },
+  ]},
+  { id:"echo", emoji:"📢", label:"Echo (say something)", needs:"channel", fields:[
+    { key:"message", label:"Message text", style:2, required:true, max:1000 },
+  ]},
+  { id:"theremnant", emoji:"👁️", label:"The Remnant Transmission", needs:"channel", fields:[
+    { key:"message", label:"Transmission text", style:2, required:true, max:1000 },
+  ]},
+
+  // ── Raw Discord moderation/admin actions — not wrapped by any existing slash
+  // command, called straight against the Discord API against the reply target.
+  { id:"kick", emoji:"👢", label:"Kick", needs:"member", fields:[
+    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+  ]},
+  { id:"ban", emoji:"🔨", label:"Ban", needs:"member", fields:[
+    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+    { key:"deleteDays", label:"Delete message history — days, 0-7 (blank=0)", style:1, required:false, max:1 },
+  ]},
+  { id:"timeout", emoji:"⏱️", label:"Timeout", needs:"member", fields:[
+    { key:"duration", label:"Duration in minutes (max 40320 / 28 days)", style:1, required:true, max:6 },
+    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+  ]},
+  { id:"remove_timeout", emoji:"🔓", label:"Remove Timeout", needs:"member", fields:[] },
+  { id:"add_role", emoji:"➕", label:"Add Role", needs:"member", fields:[
+    { key:"role", label:"Role name or ID", style:1, required:true, max:100 },
+  ]},
+  { id:"remove_role", emoji:"➖", label:"Remove Role", needs:"member", fields:[
+    { key:"role", label:"Role name or ID", style:1, required:true, max:100 },
+  ]},
+  { id:"set_nickname", emoji:"✏️", label:"Set Nickname", needs:"member", fields:[
+    { key:"nickname", label:"New nickname (blank=reset to username)", style:1, required:false, max:32 },
+  ]},
+  { id:"dm_user", emoji:"✉️", label:"DM the User", needs:"user", fields:[
+    { key:"message", label:"Message text", style:2, required:true, max:1500 },
+  ]},
+  { id:"pin_message", emoji:"📌", label:"Pin the Message", needs:"message", fields:[] },
+  { id:"delete_message", emoji:"🗑️", label:"Delete the Message", needs:"message", fields:[] },
+  { id:"add_reaction", emoji:"🙂", label:"React to the Message", needs:"message", fields:[
+    { key:"emoji", label:"Emoji (unicode, or custom ID like name:id)", style:1, required:true, max:100 },
+  ]},
+  { id:"voice_disconnect", emoji:"🔇", label:"Disconnect from Voice", needs:"member", fields:[] },
+];
+
+function formatJarvisActionsList(actions){
+  if(!actions || !actions.length) return "_No actions yet._";
+  return actions.map((a,i) => {
+    const def = JARVISENHANCE_ACTIONS.find(x => x.id === a.type);
+    const preview = Object.entries(a.params||{}).filter(([,v]) => v).map(([k,v]) => `${k}: ${v}`).join(", ");
+    return `**${i+1}.** ${def?.emoji||"❓"} ${def?.label||a.type}${preview?` _(${preview})_`:""}`;
+  }).join("\n");
+}
+
+function buildJarvisEnhancePanel(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const actionOptions = JARVISENHANCE_ACTIONS.map(a => ({ label:`${a.emoji} ${a.label}`, value:a.id }));
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_addtype_${token}`).setPlaceholder("➕ Add an action…").setOptions(actionOptions)
+    ),
+  ];
+  if(b.actions.length){
+    const stepOptions = b.actions.map((a,i) => {
+      const def = JARVISENHANCE_ACTIONS.find(x => x.id === a.type);
+      return { label:`${i+1}. ${def?.emoji||"❓"} ${def?.label||a.type}`.slice(0,100), value:String(i), default:b.selectedStep===i };
+    });
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_manage_${token}`).setPlaceholder("Select a step to reorder / remove…").setOptions(stepOptions)
+    ));
+  }
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`je_moveup_${token}`).setLabel("🔼 Move Up").setStyle("SECONDARY").setDisabled(b.selectedStep===null || b.selectedStep===0),
+    new MessageButton().setCustomId(`je_movedown_${token}`).setLabel("🔽 Move Down").setStyle("SECONDARY").setDisabled(b.selectedStep===null || b.selectedStep===b.actions.length-1),
+    new MessageButton().setCustomId(`je_removestep_${token}`).setLabel("🗑️ Remove Step").setStyle("DANGER").setDisabled(b.selectedStep===null),
+  ));
+  rows.push(new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`je_triggers_${token}`).setLabel("✏️ Set Trigger Word(s)").setStyle("PRIMARY"),
+    new MessageButton().setCustomId(`je_ownerlock_${token}`).setLabel(b.ownerLocked ? "🔒 Owner Locked: ON" : "🔓 Owner Locked: OFF").setStyle(b.ownerLocked ? "DANGER" : "SECONDARY"),
+    new MessageButton().setCustomId(`je_save_${token}`).setLabel("✅ Save Profile").setStyle("SUCCESS").setDisabled(!b.triggers.length || !b.actions.length),
+    new MessageButton().setCustomId(`je_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+  ));
+
+  const content = [
+    `🧠 **Jarvis Enhance** — configuring \`${b.name}\``,
+    ``,
+    `**Trigger word(s):** ${b.triggers.length ? b.triggers.map(t=>`\`${t}\``).join(" ") : "_none set_"}`,
+    `_Works just like the Jarvis image trigger: reply to a message and say "Jarvis, <word>" or "RoyalBot, <word>" — same whole-word matching._`,
+    b.ownerLocked
+      ? `🔒 **Owner Locked** — only the owner (or someone granted this via \`/tempowner\`) can fire this trigger.`
+      : `🔓 **Owner Locked is OFF** — anyone in the server can fire this trigger by saying the word.`,
+    ``,
+    `**Actions (run in this order):**`,
+    formatJarvisActionsList(b.actions),
+  ].join("\n");
+
+  return { content, components: rows };
+}
+
+// Executes one saved profile's action chain in order against the resolved
+// context. Each runner mirrors the exact logic of the equivalent existing
+// owner command/context-menu action, just invoked directly instead of through
+// a slash command interaction.
+const JARVISENHANCE_RUNNERS = {
+  async clankerify(params, ctx){
+    const dur = (params.duration||"").trim();
+    if(dur === "0"){ clankerify.delete(ctx.targetUser.id); saveData(); return "disabled"; }
+    const mode = (params.mode||"").trim();
+    const expiresAt = dur ? Date.now() + parseInt(dur,10)*60000 : null;
+    clankerify.set(ctx.targetUser.id, { expiresAt, mode: mode && mode!=="none" ? mode : null, ownerClanked:true });
+    saveData();
+    return `set${mode?` (${mode})`:""}`;
+  },
+  async impersonation(params, ctx){
+    const dur = (params.duration||"").trim();
+    if(dur === "0"){ clankerify.delete(ctx.targetUser.id); saveData(); return "disabled"; }
+    const mode = (params.mode||"").trim();
+    const expiresAt = dur ? Date.now() + parseInt(dur,10)*60000 : null;
+    clankerify.set(ctx.targetUser.id, { expiresAt, mode: mode && mode!=="none" ? mode : null, ownerClanked:true, impersonateAsUserId:null, impersonateName:null, impersonateAvatarURL:null });
+    saveData();
+    return `set${mode?` (${mode})`:""}`;
+  },
+  async shadowdelete(params, ctx){
+    const pct = Math.max(0, Math.min(100, parseInt(params.percentage,10)||0));
+    if(pct===0){ shadowDelete.delete(ctx.targetUser.id); saveData(); return "disabled"; }
+    shadowDelete.set(ctx.targetUser.id, pct);
+    saveData();
+    return `${pct}%`;
+  },
+  async paranoia(params, ctx){
+    if(paranoiaWatchers.has(ctx.targetUser.id)){ paranoiaWatchers.delete(ctx.targetUser.id); saveData(); return "disarmed"; }
+    const chance = Math.min(100, Math.max(1, parseInt(params.chance,10)||100));
+    paranoiaWatchers.set(ctx.targetUser.id, { chance, armed:true });
+    saveData();
+    return `armed (${chance}%)`;
+  },
+  async clank_this(params, ctx){
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    clankerify.set(ctx.targetUser.id, { expiresAt: Date.now() + 10*60000, mode:null, ownerClanked:true });
+    saveData();
+    setTimeout(() => { clankerify.delete(ctx.targetUser.id); saveData(); }, 10*60000);
+    return "10 min";
+  },
+  async reaction_bomb(params, ctx){
+    const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
+    for(const emoji of BOMB_EMOJIS){ await ctx.targetMsg.react(emoji).catch(()=>{}); }
+    return "done";
+  },
+  async expose(params, ctx){
+    const content = ctx.targetMsg.content || "(no text)";
+    const exposePrefixes = ["🚨 CAUGHT IN 4K:","📢 ATTENTION EVERYONE:","🔍 EXPOSE THREAD:","📸 SCREENSHOT THIS:","⚠️ EVIDENCE:"];
+    const prefix = exposePrefixes[Math.floor(Math.random()*exposePrefixes.length)];
+    await ctx.channel.send({ content:`${prefix}\n> ${content}\n— <@${ctx.targetUser.id}>` }).catch(()=>{});
+    return "done";
+  },
+  async jarvis_image(params, ctx){
+    const imgs = await getJarvisImages();
+    if(!imgs.length) return "no images";
+    const pick = imgs[Math.floor(Math.random()*imgs.length)];
+    await ctx.targetMsg.reply({ files:[pick.download_url], allowedMentions:{repliedUser:false} }).catch(()=>{});
+    return pick.word;
+  },
+  async forcedivorce(params, ctx){
+    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    if(!s.marriedTo) return "not married";
+    const partner = scores.get(s.marriedTo);
+    if(partner){ partner.marriedTo=null; partner.pendingProposal=null; partner.forceMarried=false; }
+    s.marriedTo=null; s.pendingProposal=null; s.forceMarried=false;
+    saveData();
+    return "done";
+  },
+  async forcemarry(params, ctx){
+    const idMatch = (params.user2||"").match(/\d{15,20}/);
+    if(!idMatch) return "no valid user2";
+    const u2 = await client.users.fetch(idMatch[0]).catch(()=>null);
+    if(!u2) return "user2 not found";
+    if(u2.id === ctx.targetUser.id) return "skipped (same user)";
+    const s1 = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    const s2 = getScore(u2.id, u2.username);
+    if(s1.marriedTo || s2.marriedTo) return "already married";
+    s1.marriedTo=u2.id; s1.pendingProposal=null; s1.forceMarried=true;
+    s2.marriedTo=ctx.targetUser.id; s2.pendingProposal=null; s2.forceMarried=true;
+    saveData();
+    return "done";
+  },
+  async fakequote(params, ctx){
+    try{
+      const displayName = ctx.targetUser.username;
+      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+      const avatarRes = await fetch(avatarURL);
+      if(!avatarRes.ok) return "avatar fetch failed";
+      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: params.text||"", displayName, username: displayName });
+      await ctx.channel.send({ files:[{ attachment: cardBuffer, name:"quote_6660.png" }] }).catch(()=>{});
+      return "done";
+    }catch(e){ return `error: ${e.message}`; }
+  },
+  async echo(params, ctx){
+    await ctx.channel.send({ content:(params.message||"").slice(0,2000), allowedMentions:{parse:[]} }).catch(()=>{});
+    return "done";
+  },
+  async theremnant(params, ctx){
+    await ctx.channel.send({
+      embeds:[{ title:"👁️ The Remnant", description:(params.message||"").slice(0,1000), color:0x8E44AD, footer:{text:"A signal from somewhere else…"}, timestamp:new Date().toISOString() }],
+    }).catch(()=>{});
+    return "done";
+  },
+
+  // ── Raw Discord moderation/admin runners ────────────────────────────────────
+  async kick(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    if(!ctx.targetMember.kickable) return "cannot kick (permissions/hierarchy)";
+    await ctx.targetMember.kick(params.reason || undefined);
+    return `kicked${params.reason ? ` (${params.reason})` : ""}`;
+  },
+  async ban(params, ctx){
+    const days = Math.max(0, Math.min(7, parseInt(params.deleteDays,10) || 0));
+    if(ctx.targetMember && !ctx.targetMember.bannable) return "cannot ban (permissions/hierarchy)";
+    await ctx.guild.members.ban(ctx.targetUser.id, { days, reason: params.reason || undefined });
+    return `banned${params.reason ? ` (${params.reason})` : ""}`;
+  },
+  async timeout(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const mins = Math.max(1, Math.min(40320, parseInt(params.duration,10) || 0));
+    if(!mins) return "invalid duration";
+    if(!ctx.targetMember.moderatable) return "cannot timeout (permissions/hierarchy)";
+    await ctx.targetMember.timeout(mins*60000, params.reason || undefined);
+    return `${mins} min`;
+  },
+  async remove_timeout(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    await ctx.targetMember.timeout(null).catch(()=>{});
+    return "cleared";
+  },
+  async add_role(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const q = (params.role||"").trim().toLowerCase();
+    const role = ctx.guild.roles.cache.find(r => r.id===q || r.name.toLowerCase()===q);
+    if(!role) return "role not found";
+    if(role.managed || role.position >= ctx.guild.members.me.roles.highest.position) return "cannot assign that role (hierarchy)";
+    await ctx.targetMember.roles.add(role);
+    return `added ${role.name}`;
+  },
+  async remove_role(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    const q = (params.role||"").trim().toLowerCase();
+    const role = ctx.guild.roles.cache.find(r => r.id===q || r.name.toLowerCase()===q);
+    if(!role) return "role not found";
+    await ctx.targetMember.roles.remove(role);
+    return `removed ${role.name}`;
+  },
+  async set_nickname(params, ctx){
+    if(!ctx.targetMember) return "not in server";
+    if(!ctx.targetMember.manageable) return "cannot rename (permissions/hierarchy)";
+    await ctx.targetMember.setNickname(params.nickname || null);
+    return params.nickname ? `set to "${params.nickname}"` : "reset";
+  },
+  async dm_user(params, ctx){
+    const ok = await ctx.targetUser.send({ content:(params.message||"").slice(0,1500) }).then(()=>true).catch(()=>false);
+    return ok ? "sent" : "failed (DMs closed)";
+  },
+  async pin_message(params, ctx){
+    await ctx.targetMsg.pin();
+    return "pinned";
+  },
+  async delete_message(params, ctx){
+    await ctx.targetMsg.delete();
+    return "deleted";
+  },
+  async add_reaction(params, ctx){
+    await ctx.targetMsg.react((params.emoji||"").trim());
+    return "reacted";
+  },
+  async voice_disconnect(params, ctx){
+    if(!ctx.targetMember || !ctx.targetMember.voice?.channel) return "not in voice";
+    await ctx.targetMember.voice.disconnect();
+    return "disconnected";
+  },
+};
+
+async function runJarvisEnhanceProfile(profile, ctx){
+  const results = [];
+  for(const step of profile.actions){
+    const def = JARVISENHANCE_ACTIONS.find(a => a.id === step.type);
+    const runner = JARVISENHANCE_RUNNERS[step.type];
+    if(!def || !runner){ results.push(`❓ ${step.type}: unknown action`); continue; }
+    try{
+      const outcome = await runner(step.params||{}, ctx);
+      results.push(`${def.emoji} ${def.label}: ${outcome}`);
+    }catch(e){
+      results.push(`${def.emoji} ${def.label}: ❌ ${e.message}`);
+    }
+    await new Promise(res => setTimeout(res, 500));
+  }
+  return results;
 }
 
 // trashcanVotes: messageId -> { filename, voters: Set<userId>, guildId, channelId, sentToDeleter: bool }
@@ -1334,7 +1667,6 @@ function buildDataObject() {
     shadowDelete: [...shadowDelete.entries()],
     clankerify:   [...clankerify.entries()],
     theCountChannels: [...theCountChannels.entries()],
-    betaTestingConfigs: [...betaTestingConfigs.entries()].map(([gid,c]) => [gid, { categoryId:c.categoryId, channelIds:c.channelIds, testers:[...c.testers.entries()] }]),
     reactionRoles:    [...reactionRoles.entries()],
     disabledOwnerMsg: [...disabledOwnerMsg],
     disabledLevelUp:  [...disabledLevelUp],
@@ -1378,6 +1710,7 @@ function buildDataObject() {
     dmRelayChannels:      [...dmRelayChannels.entries()],
     paranoiaWatchers:     [...paranoiaWatchers.entries()],
     customClankerModes:   [...customClankerModes.entries()],
+    jarvisEnhanceProfiles: [...jarvisEnhanceProfiles.entries()],
     serverStatsConfig:    [...serverStatsConfig.entries()],
     boostHistory:         [...boostHistory.entries()].map(([gid,m]) => [gid, [...m.entries()]]),
     quoteUserVotes:       [...quoteUserVotes.entries()].map(([fn, m]) => [fn, [...m.entries()]]),
@@ -1433,9 +1766,6 @@ function loadData() {
       });
     }
     if (data.theCountChannels) data.theCountChannels.forEach(([k,v]) => theCountChannels.set(k, v));
-    if (data.betaTestingConfigs) data.betaTestingConfigs.forEach(([gid,c]) => {
-      betaTestingConfigs.set(gid, { categoryId:c.categoryId, channelIds:c.channelIds, testers: new Map(c.testers) });
-    });
     if (data.autoRoles)        data.autoRoles       .forEach(([k,v]) => autoRoles.set(k, v));
     if (data.reactionRoles)    data.reactionRoles   .forEach(([k,v]) => reactionRoles.set(k, v));
     if (data.disabledOwnerMsg) data.disabledOwnerMsg.forEach(v => disabledOwnerMsg.add(v));
@@ -1631,6 +1961,7 @@ function loadData() {
     }
     if (data.paranoiaWatchers) data.paranoiaWatchers.forEach(([k,v]) => paranoiaWatchers.set(k, v));
     if (data.customClankerModes) data.customClankerModes.forEach(([k,v]) => customClankerModes.set(k, v));
+    if (data.jarvisEnhanceProfiles) data.jarvisEnhanceProfiles.forEach(([k,v]) => jarvisEnhanceProfiles.set(k, v));
     if (data.serverStatsConfig) data.serverStatsConfig.forEach(([k,v]) => serverStatsConfig.set(k, v));
     if (data.boostHistory) data.boostHistory.forEach(([gid,arr]) => { boostHistory.set(gid, new Map(arr)); });
     if (data.quoteUserVotes) data.quoteUserVotes.forEach(([fn, entries]) => quoteUserVotes.set(fn, new Map(entries)));
@@ -2033,15 +2364,6 @@ async function safeReply(interaction, payload) {
     // errors — these happen when Discord's 3-second window has expired.
     if(e?.code !== 10062 && !e?.message?.includes("already been acknowledged")){
       console.error("[safeReply error]", e?.message);
-      // Last-resort fallback: if reply() threw before acknowledging at all (e.g. a
-      // client-side payload validation error), defer + show a visible error instead
-      // of leaving Discord's "thinking…" spinner stuck forever with no follow-up.
-      if(!interaction.replied && !interaction.deferred){
-        try{
-          await interaction.deferReply({ephemeral:true}).catch(()=>{});
-          await interaction.editReply({content:"❌ Something went wrong building that response.",embeds:[],components:[]}).catch(()=>{});
-        }catch{}
-      }
     }
   }
 }
@@ -2678,7 +3000,7 @@ function buildTicketSetupStep(guild, guildId, stepOverride) {
     )];
   }
 
-  return { embeds: [embed], components };
+  return { content: "", embeds: [embed], components };
 }
 
 // ── YouTube helpers ───────────────────────────────────────────────────────────
@@ -3497,8 +3819,8 @@ const OWNER_ONLY_CMDS = new Set([
   "servers","fakemessage","fakequote","dmconfig","leaveserver","restart","refreshcmds",
   "botstats","setstatus","adminconfig",
   "shadowdelete","clankerify","impersonation","forcemarry","forcedivorce","echo","paranoia",
-  "thecount","send","betatesting",
-  "tempowner","blacklist","theremnant",
+  "thecount","send",
+  "tempowner","blacklist","theremnant","jarvisenhance",
   // Owner context-menu commands
   "Reaction Bomb","Clank This","Expose",
 ]);
@@ -3597,7 +3919,7 @@ function buildCommands(){
       {name:"message",       description:"Custom announcement message (for add, optional)",        type:3,required:false},
     ]},
     {name:"servers",        description:"[Owner] List servers"},
-    {name:"fakemessage",    description:"[Owner] Send a message as another user via webhook",options:[{name:"user",description:"User to impersonate",type:6,required:true},{name:"message",description:"Message text to send",type:3,required:false},{name:"file",description:"File to send",type:11,required:false},{name:"mode",description:"Clankerify mode to apply to the message",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"},{name:"Scottish",value:"scottish"},{name:"Random",value:"random"}]}]},
+    {name:"fakemessage",    description:"[Owner] Send a message as another user via webhook",options:[{name:"user",description:"User to impersonate",type:6,required:true},{name:"message",description:"Message text to send",type:3,required:false},{name:"file",description:"File to send",type:11,required:false},{name:"mode",description:"Clankerify mode to apply to the message",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"},{name:"Random",value:"random"}]}]},
     {name:"fakequote",      description:"[Owner] Generate a 'Make it a Quote' style image card for a user",options:[
       {name:"user",         description:"User to feature (pulls their avatar, username & display name)",type:6,required:true},
       {name:"text",         description:"The quote text to display",type:3,required:true},
@@ -3638,17 +3960,13 @@ function buildCommands(){
       {name:"as_user",  description:"Impersonate as this user's name/avatar (can't combine with pfp/name)", type:6, required:false},
       {name:"pfp",      description:"Custom profile picture for the webhook (can't combine with as_user)",  type:11, required:false},
       {name:"name",     description:"Custom display name for the webhook (can't combine with as_user)",     type:3, required:false},
-      {name:"mode",     description:"Clankerify mode to apply to messages",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"},{name:"Scottish",value:"scottish"}]},
+      {name:"mode",     description:"Clankerify mode to apply to messages",type:3,required:false,choices:[{name:"No mode (plain)",value:"none"},{name:"Evil",value:"evil"},{name:"Freaky",value:"freaky"},{name:"American",value:"american"},{name:"British",value:"british"},{name:"Stupid",value:"stupid"},{name:"Boomer",value:"boomer"},{name:"Conspiracy",value:"conspiracy"},{name:"NPC",value:"npc"},{name:"Sigma",value:"sigma"},{name:"Medieval",value:"medieval"},{name:"Ghost",value:"ghost"},{name:"Pirate",value:"pirate"},{name:"RespawnRaccoon Propaganda",value:"rr_propaganda"},{name:"French",value:"french"},{name:"UWU / LOLCAT",value:"uwu"}]},
       {name:"duration", description:"Duration in minutes (omit for permanent, 0 to disable)",  type:4, required:false},
     ]},
     {name:"thecount", description:"[Owner] Open (or reuse) a queue channel for a user — nothing sent there reaches them until /send", default_member_permissions:"0", options:[
       {name:"user", description:"User to open a queue channel for", type:6, required:true},
     ]},
     {name:"send", description:"[Owner] Deliver every queued message across all /thecount channels to their respective users", default_member_permissions:"0", options:[]},
-    {name:"betatesting", description:"[Owner] Grant a user access to run select owner commands in a controlled beta-testing category", default_member_permissions:"0", options:[
-      {name:"user",     description:"User to grant beta-testing access to",                     type:6, required:true},
-      {name:"duration", description:"Duration in minutes (omit for permanent, 0 to revoke)",   type:4, required:false},
-    ]},
     {name:"selfclank",  description:"Self-clankerify yourself for 1–5 minutes (0 to cancel, 2 people per server at a time)",options:[
       {name:"duration", description:"Duration in minutes (1–5), or 0 to cancel early",type:4,required:true},
     ]},
@@ -3750,6 +4068,15 @@ function buildCommands(){
     ]},
     {name:"theremnant", description:"[Owner] Send a mysterious dimensional transmission to this channel",options:[
       {name:"message",description:"The text to transmit",type:3,required:true,max_length:1000},
+    ]},
+    {name:"jarvisenhance", description:"[Owner] Build a custom Jarvis trigger word that chains any bot action, in order",options:[
+      {name:"action",description:"What to do",type:3,required:true,choices:[
+        {name:"Create",       value:"create"},
+        {name:"Edit",         value:"edit"},
+        {name:"List all",     value:"list"},
+        {name:"Delete",       value:"delete"},
+      ]},
+      {name:"name",description:"Profile ID (required for create/edit/delete)",type:3,required:false},
     ]},
     {name:"download", description:"Download a YouTube video as MP4 or MP3",options:[
       {name:"url",        description:"YouTube video URL",type:3,required:true},
@@ -4773,108 +5100,11 @@ client.on("messageCreate",async msg=>{
           }
         }
 
-        // ── Scottish mode ─────────────────────────────────────────────────────
-        if(mode === "scottish"){
-          const rawDisplay = member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username;
-          displayName = `sco'ish ${rawDisplay} 'aye`;
-          if(sendContent){
-            const scotSwaps = [
-              [/\bhello\b/gi,"hullo"],[/\bhi\b/gi,"awright"],[/\bhey\b/gi,"haw"],
-              [/\bgoodbye\b/gi,"cheerio"],[/\bbye\b/gi,"see ye"],
-              [/\bfriend\b/gi,"pal"],[/\bfriends\b/gi,"pals"],
-              [/\bman\b/gi,"lad"],[/\bwoman\b/gi,"lass"],[/\bboy\b/gi,"laddie"],[/\bgirl\b/gi,"lassie"],
-              [/\bchild\b/gi,"bairn"],[/\bchildren\b/gi,"bairns"],
-              [/\bsmall\b/gi,"wee"],[/\bvery\b/gi,"pure"],[/\breally\b/gi,"right"],
-              [/\bbig\b/gi,"massive"],[/\bhouse\b/gi,"hoose"],[/\bhome\b/gi,"hame"],
-              [/\bfood\b/gi,"scran"],[/\beat\b/gi,"munch"],[/\bdrink\b/gi,"swally"],
-              [/\bbeer\b/gi,"pint"],[/\bwhiskey\b/gi,"whisky"],[/\bpub\b/gi,"boozer"],
-              [/\broad\b/gi,"roadie"],[/\bstreet\b/gi,"streetie"],[/\bcar\b/gi,"motor"],
-              [/\btruck\b/gi,"lorry"],[/\bbus\b/gi,"motorbus"],[/\bwalk\b/gi,"stroll"],
-              [/\brun\b/gi,"leg it"],[/\blook\b/gi,"have a keek"],[/\bsee\b/gi,"spy"],
-              [/\bwatch\b/gi,"keep an eye oan"],[/\blisten\b/gi,"haud yer lugs open"],
-              [/\bhear\b/gi,"catch"],[/\bspeak\b/gi,"blether"],[/\btalk\b/gi,"blether"],
-              [/\bsay\b/gi,"tell"],[/\btell\b/gi,"gie the word"],
-              [/\bthink\b/gi,"reckon"],[/\bknow\b/gi,"ken"],[/\bunderstand\b/gi,"get"],
-              [/\bremember\b/gi,"mind"],[/\bforget\b/gi,"mislay"],
-              [/\bfind\b/gi,"come across"],[/\blost\b/gi,"away"],
-              [/\bstupid\b/gi,"daft"],[/\bidiot\b/gi,"numpty"],[/\bmoron\b/gi,"eejit"],
-              [/\bcrazy\b/gi,"mental"],[/\bweird\b/gi,"bizarre-like"],
-              [/\bcool\b/gi,"braw"],[/\bgreat\b/gi,"grand"],[/\bgood\b/gi,"guid"],
-              [/\bbad\b/gi,"shite"],[/\bterrible\b/gi,"awful"],
-              [/\bawesome\b/gi,"pure brilliant"],[/\bamazing\b/gi,"cracking"],
-              [/\bbeautiful\b/gi,"bonnie"],[/\bugly\b/gi,"mingin"],[/\bdirty\b/gi,"clarty"],
-              [/\bclean\b/gi,"tidy"],[/\bhappy\b/gi,"chuffed"],[/\bsad\b/gi,"gutted"],
-              [/\bangry\b/gi,"ragin"],[/\bannoyed\b/gi,"scunnered"],
-              [/\btired\b/gi,"knackered"],[/\bsleep\b/gi,"kip"],[/\bbed\b/gi,"pit"],
-              [/\bmorning\b/gi,"mornin"],[/\bevening\b/gi,"nicht"],[/\bnight\b/gi,"nicht"],
-              [/\btoday\b/gi,"the day"],[/\btomorrow\b/gi,"the morn"],[/\byesterday\b/gi,"yestreen"],
-              [/\bnow\b/gi,"noo"],[/\blater\b/gi,"after"],[/\bsoon\b/gi,"shortly"],
-              [/\balways\b/gi,"aye"],[/\bnever\b/gi,"nae chance"],[/\bmaybe\b/gi,"mibbe"],
-              [/\bprobably\b/gi,"likely"],[/\byes\b/gi,"aye"],[/\byeah\b/gi,"aye"],
-              [/\bnope\b/gi,"naw"],[/\bnothing\b/gi,"naethin"],
-              [/\bsomething\b/gi,"somethin"],[/\beverything\b/gi,"awthin"],
-              [/\beveryone\b/gi,"awbody"],[/\bnobody\b/gi,"naebody"],
-              [/\bmy\b/gi,"ma"],[/\bmine\b/gi,"mines"],[/\bmyself\b/gi,"masel"],
-              [/\bthem\b/gi,"thum"],[/\btheir\b/gi,"thair"],[/\bthere\b/gi,"ower there"],
-              [/\bwhere\b/gi,"whaur"],[/\bwhy\b/gi,"how come"],[/\bwhen\b/gi,"whin"],
-              [/\bwhat\b/gi,"whit"],[/\bwho\b/gi,"wha"],[/\bhow\b/gi,"hoo"],
-              [/\bisn't\b/gi,"isnae"],[/\baren't\b/gi,"urnae"],[/\bcan't\b/gi,"cannae"],
-              [/\bwon't\b/gi,"winnae"],[/\bshouldn't\b/gi,"shouldnae"],
-              [/\bwouldn't\b/gi,"wouldnae"],[/\bcouldn't\b/gi,"couldnae"],
-              [/\bdidn't\b/gi,"didnae"],[/\bdoesn't\b/gi,"disnae"],
-              [/\bhaven't\b/gi,"havenae"],[/\bhasn't\b/gi,"hasnae"],
-              [/\bmustn't\b/gi,"maunnae"],[/\bgoing\b/gi,"gaun"],[/\bgo\b/gi,"gang"],
-              [/\bcome\b/gi,"c'mere"],[/\bleave\b/gi,"head aff"],
-              [/\bstop\b/gi,"haud up"],[/\bwait\b/gi,"haud on"],
-              [/\bsit\b/gi,"sit doon"],[/\bstand\b/gi,"staun"],
-              [/\bwork\b/gi,"graft"],[/\bjob\b/gi,"graft"],
-              [/\bmoney\b/gi,"dosh"],[/\brich\b/gi,"loaded"],[/\bpoor\b/gi,"skint"],
-              [/\bshop\b/gi,"shoap"],[/\bstore\b/gi,"shoap"],
-              [/\bbuy\b/gi,"pick up"],[/\bsell\b/gi,"shift"],
-              [/\bphone\b/gi,"mobile"],[/\bcomputer\b/gi,"pc"],[/\binternet\b/gi,"the net"],
-              [/\bdog\b/gi,"dug"],[/\bcat\b/gi,"moggie"],[/\bbird\b/gi,"burd"],
-              [/\bcow\b/gi,"coo"],[/\bsheep\b/gi,"yowe"],[/\bhorse\b/gi,"clydesdale"],
-              [/\brain\b/gi,"dreich weather"],[/\bcold\b/gi,"baltic"],[/\bhot\b/gi,"boilin"],
-              [/\bwindy\b/gi,"blawin a gale"],[/\bsnow\b/gi,"snaw"],
-              [/\bmountain\b/gi,"ben"],[/\briver\b/gi,"burn"],[/\bforest\b/gi,"woods"],
-              [/\bocean\b/gi,"sea"],[/\bbeach\b/gi,"shore"],
-              [/\bfight\b/gi,"square go"],[/\bpunch\b/gi,"clout"],[/\bhit\b/gi,"wallop"],
-              [/\blaugh\b/gi,"have a giggle"],[/\bcry\b/gi,"greet"],
-              [/\bface\b/gi,"coupon"],[/\bhead\b/gi,"heid"],[/\bmouth\b/gi,"gub"],
-              [/\bnose\b/gi,"neb"],[/\bears\b/gi,"lugs"],[/\bhands\b/gi,"hauns"],[/\bfeet\b/gi,"plates"],
-              [/\bshirt\b/gi,"tap"],[/\bpants\b/gi,"troosers"],[/\bshoes\b/gi,"trainers"],
-              [/\bpolice\b/gi,"the polis"],[/\bjail\b/gi,"the nick"],
-              [/\bteacher\b/gi,"master"],[/\bschool\b/gi,"skool"],
-              [/\buniversity\b/gi,"uni"],[/\bstudent\b/gi,"pupil"],[/\bexam\b/gi,"test"],
-              [/\bgame\b/gi,"match"],[/\bfootball\b/gi,"fitba"],[/\bsoccer\b/gi,"fitba"],
-              [/\bteam\b/gi,"side"],[/\bwinner\b/gi,"champ"],[/\bloser\b/gi,"mug"],
-            ];
-            let t = sendContent;
-            for(const [from, to] of scotSwaps) t = t.replace(from, to);
-            const signoffs = [
-              "  Where's me fockinʼ Iron Bru",
-              "  Now fack off ya wee wanker",
-              "  SCOTLAND FOREEVVVVVERRRRRRR",
-              "  Ye look schewpid readinʼ this, mate",
-              "  Royal V- is a nerd",
-            ];
-            sendContent = t + signoffs[Math.floor(Math.random()*signoffs.length)];
-          } else {
-            const scotIdles = [
-              "*takes a swig of Iron Bru*",
-              "och aye the noo…",
-              "*adjusts kilt aggressively*",
-              "SCOTLAND!!",
-              "cannae be bothered wi this",
-            ];
-            sendContent = scotIdles[Math.floor(Math.random()*scotIdles.length)];
-          }
-        }
 
 
         // ── Random mode — pick a random real mode each message ────────────────
         if(mode === "random"){
-          const RANDOM_MODES = ["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu","scottish"];
+          const RANDOM_MODES = ["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu"];
           const pickedMode = RANDOM_MODES[Math.floor(Math.random()*RANDOM_MODES.length)];
           displayName = `Randomized ${member?.displayName || msg.author.displayName || msg.author.globalName || msg.author.username}`;
           // Re-run through the handler by temporarily overriding mode (we replicate the block inline)
@@ -4938,10 +5168,6 @@ client.on("messageCreate",async msg=>{
             const uwuOut2=["mrrp","  :3","  meow meow :3","  Nyah~!"];
             if(sendContent){ let t=sendContent; for(const [f,r] of uwuSwaps2) t=t.replace(f,r); sendContent=t+"  "+uwuOut2[Math.floor(Math.random()*uwuOut2.length)]; }
             else sendContent="*purrs* mrrp :3";
-          } else if(_rm === "scottish"){
-            const scotOut2=["  Where's me fockinʼ Iron Bru","  SCOTLAND FOREEVVVVVERRRRRRR","  Now fack off ya wee wanker"];
-            if(sendContent){ let t=sendContent.replace(/\byes\b/gi,"aye").replace(/\bno\b/gi,"naw").replace(/\bfriend\b/gi,"pal").replace(/\bman\b/gi,"lad").replace(/\bsmall\b/gi,"wee").replace(/\bvery\b/gi,"pure").replace(/\bgood\b/gi,"guid").replace(/\bbad\b/gi,"shite").replace(/\bcool\b/gi,"braw"); sendContent=t+scotOut2[Math.floor(Math.random()*scotOut2.length)]; }
-            else sendContent="och aye the noo… *adjusts kilt*";
           }
         }
 
@@ -5094,6 +5320,40 @@ client.on("messageCreate",async msg=>{
           }
         }
       } catch(e) { console.error("Jarvis trigger error:", e.message); }
+    }
+  }
+
+  // ── Jarvis Enhance: owner-built automation chains, triggered by word ────────
+  // Same shape as the image trigger above — reply + wake word — but matched
+  // against saved profiles' trigger word(s) using identical whole-word
+  // tokenized matching. Each profile can be owner-locked (only the owner, or
+  // someone granted /jarvisenhance via /tempowner, can fire it) or unlocked
+  // (anyone can say the word).
+  if(msg.reference && jarvisEnhanceProfiles.size){
+    const jeWakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b/i);
+    if(jeWakeMatch){
+      try {
+        const jeWords = (msg.content.toLowerCase().match(/[a-z0-9]+/g)) || [];
+        const jeWordSet = new Set(jeWords);
+        const profile = [...jarvisEnhanceProfiles.values()].find(p =>
+          p.triggers.some(t => jeWordSet.has(t.toLowerCase()))
+        );
+        if(profile){
+          const locked = profile.ownerLocked !== false;
+          const allowed = locked ? isEffectiveOwner(msg.author.id, "jarvisenhance") : !msg.author.bot;
+          if(allowed){
+            const targetMsg = await msg.fetchReference().catch(() => null);
+            if(targetMsg){
+              const targetMember = msg.guild ? await msg.guild.members.fetch(targetMsg.author.id).catch(() => null) : null;
+              const ctx = { targetMsg, targetUser: targetMsg.author, targetMember, channel: msg.channel, guild: msg.guild };
+              const results = await runJarvisEnhanceProfile(profile, ctx);
+              await msg.reply({ content:`🤖 **Jarvis Enhance** ran:\n${results.join("\n")}`, allowedMentions:{ repliedUser:false } }).catch(()=>{});
+            }
+          } else if(locked){
+            await msg.reply({ content:"🔒 That Jarvis Enhance trigger is owner locked.", allowedMentions:{ repliedUser:false } }).catch(()=>{});
+          }
+        }
+      } catch(e) { console.error("Jarvis Enhance trigger error:", e.message); }
     }
   }
 
@@ -6447,9 +6707,9 @@ client.on("interactionCreate",async interaction=>{
         {title:"⚙️ Server Config  —  Page 3 / 8",description:["Most commands here require **Manage Server** permission.","","**Channels & Messages**","`/channelpicker channel:… [levelup]` — Set the bot's main channel","`/xpconfig setting:…` — Level-up messages (on/off, ping toggle, channel)","`/setwelcome channel:… [message]` — Welcome message (`{user}` `{server}` `{count}`)","`/setleave channel:… [message]` — Leave message","`/setboostmsg channel:… [message]` — Boost announcement","`/disableownermsg enabled:…` — Toggle bot owner broadcasts","`/purge amount:…` — Bulk delete (needs Manage Messages)","`/counting action:set|remove|status` — Set a permanent counting channel","","**Roles**","`/autorole [role]` — Auto-assign role on join (blank to disable)","`/reactionrole action:add|remove|list …` — Emoji reaction roles","`/rolespingfix` — List & fix roles that can @everyone","","**Competitions & Tickets**","`/invitecomp hours:…` — Invite competition with coin rewards","`/ticketsetup` · `/closeticket` · `/addtoticket` · `/removefromticket`","","**Overview**","`/serverconfig` — View all current settings"].join("\n")},
         {title:"🛡️ Activity & RA/LOA  —  Page 4 / 8",description:["**Activity Checks** *(Manage Server)*","`/activity-check channel:… [deadline] [message] [ping] [schedule]` — Send a check-in to staff","> Specify which roles must respond and who is excluded","> Auto-closes after the deadline and reports who didn't check in","> Add `schedule:Monday 09:00` (UTC) to repeat it weekly automatically","","**RA / LOA Setup** *(Manage Server)*","`/raconfig action:create` — Auto-create Reduced Activity + LOA roles","`/raconfig action:set_ra|set_loa role:…` — Use existing roles","`/raconfig action:view` — See current config","","**Assigning Roles**","`/staffrole type:ra|loa user:… action:give|remove [duration]` — Give/remove RA or LOA role","> `duration` is in hours — omit for permanent"].join("\n")},
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
-        {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
+        {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/betatesting user:… [duration]` — Grant channel-scoped access to select owner commands in a dedicated category","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word: say it while replying to run a chain of any bot action or Discord mod action (kick, ban, timeout, roles, nickname, DM, pin, delete, react, voice) in order","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const p=HELP_PAGES[page];
       const navRow=new MessageActionRow().addComponents(
@@ -6841,6 +7101,130 @@ client.on("interactionCreate",async interaction=>{
       return;
     }
 
+    // ── /jarvisenhance builder ───────────────────────────────────────────────────
+    // Add-action select: opens a param modal (unless the action needs none, in
+    // which case it's appended immediately).
+    if(cid.startsWith("je_addtype_")){
+      const token = cid.slice("je_addtype_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      const actionType = interaction.values[0];
+      const def = JARVISENHANCE_ACTIONS.find(a=>a.id===actionType);
+      if(!def) return;
+      if(!def.fields.length){
+        b.actions.push({ type:actionType, params:{} });
+        b.selectedStep = b.actions.length-1;
+        try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+        return;
+      }
+      b.pendingActionType = actionType;
+      await interaction.showModal({
+        title:`➕ ${def.label}`.slice(0,45),
+        custom_id:`je_modal_params_${token}`,
+        components: def.fields.map(f => ({type:1,components:[{type:4,custom_id:f.key,label:f.label.slice(0,45),style:f.style,required:!!f.required,max_length:f.max||100}]})),
+      }).catch(e=>console.error("[je_addtype modal]",e.message));
+      return;
+    }
+
+    // Step select: pick which step Move Up/Down/Remove act on.
+    if(cid.startsWith("je_manage_")){
+      const token = cid.slice("je_manage_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.selectedStep = parseInt(interaction.values[0],10);
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_moveup_")){
+      const token = cid.slice("je_moveup_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      const i = b.selectedStep;
+      if(i!==null && i>0){ [b.actions[i-1],b.actions[i]] = [b.actions[i],b.actions[i-1]]; b.selectedStep = i-1; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_movedown_")){
+      const token = cid.slice("je_movedown_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      const i = b.selectedStep;
+      if(i!==null && i<b.actions.length-1){ [b.actions[i],b.actions[i+1]] = [b.actions[i+1],b.actions[i]]; b.selectedStep = i+1; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_removestep_")){
+      const token = cid.slice("je_removestep_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      if(b.selectedStep!==null){ b.actions.splice(b.selectedStep,1); b.selectedStep = null; }
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_triggers_")){
+      const token = cid.slice("je_triggers_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      await interaction.showModal({
+        title:"✏️ Trigger Word(s)",
+        custom_id:`je_modal_triggers_${token}`,
+        components:[
+          {type:1,components:[{type:4,custom_id:"je_triggers_input",label:"Word(s), comma separated",style:2,required:true,value:b.triggers.join(", "),placeholder:"clankerfy, clank",max_length:300}]},
+        ],
+      }).catch(e=>console.error("[je_triggers modal]",e.message));
+      return;
+    }
+
+    if(cid.startsWith("je_ownerlock_")){
+      const token = cid.slice("je_ownerlock_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.ownerLocked = !b.ownerLocked;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_save_")){
+      const token = cid.slice("je_save_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      if(!b.triggers.length || !b.actions.length){ try{await interaction.reply({content:"❌ Set at least one trigger word and one action first.",ephemeral:true});}catch{} return; }
+      jarvisEnhanceProfiles.set(b.name, {
+        triggers: b.triggers,
+        actions: b.actions,
+        ownerLocked: b.ownerLocked !== false,
+        creatorId: uid,
+        creatorName: interaction.user.username,
+        createdAt: Date.now(),
+      });
+      saveData();
+      jarvisEnhanceBuilders.delete(token);
+      try{ await interaction.update({content:`✅ Saved \`${b.name}\`${b.ownerLocked===false ? " (unlocked — anyone can trigger it)" : " (🔒 owner locked)"}. Reply to a message and say "Jarvis, ${b.triggers[0]}" or "RoyalBot, ${b.triggers[0]}" to run it.`, components:[]}); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_cancel_")){
+      const token = cid.slice("je_cancel_".length);
+      jarvisEnhanceBuilders.delete(token);
+      try{ await interaction.update({content:"Cancelled.", components:[]}); }catch{}
+      return;
+    }
+
+    if(cid.startsWith("je_delconfirm_")){
+      const name = cid.slice("je_delconfirm_".length);
+      if(!isEffectiveOwner(uid,"jarvisenhance")){ try{await interaction.update({content:"❌ Owner only.",components:[]});}catch{} return; }
+      jarvisEnhanceProfiles.delete(name);
+      saveData();
+      try{await interaction.update({content:`✅ Deleted profile \`${name}\`.`, components:[]});}catch{}
+      return;
+    }
+    if(cid === "je_delcancel"){
+      try{await interaction.update({content:"Cancelled.", components:[]});}catch{}
+      return;
+    }
+
     // ── /TheRemnant — public "Respond" button opens a reply modal ──────────────
     if(cid === "theremnant_respond"){
       await interaction.showModal({
@@ -7143,6 +7527,34 @@ client.on("interactionCreate",async interaction=>{
       }
     }
 
+    // ── /jarvisenhance builder: action params modal submit ─────────────────────
+    if(cid.startsWith("je_modal_params_")){
+      const token = cid.slice("je_modal_params_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType)
+        return safeReply(interaction,{content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});
+      const def = JARVISENHANCE_ACTIONS.find(a => a.id === b.pendingActionType);
+      const params = {};
+      for(const f of (def?.fields||[])){
+        params[f.key] = (interaction.fields.getTextInputValue(f.key)||"").trim();
+      }
+      b.actions.push({ type:b.pendingActionType, params });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+    }
+
+    // ── /jarvisenhance builder: trigger words modal submit ──────────────────────
+    if(cid.startsWith("je_modal_triggers_")){
+      const token = cid.slice("je_modal_triggers_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid)
+        return safeReply(interaction,{content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});
+      const raw = interaction.fields.getTextInputValue("je_triggers_input")||"";
+      b.triggers = raw.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean);
+      return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+    }
+
     // ── /serverstats modal submits ──────────────────────────────────────────────
     if(cid.startsWith("ss_modal_label_")||cid.startsWith("ss_modal_emoji_")){
       if(!interaction.guildId) return;
@@ -7188,7 +7600,7 @@ client.on("interactionCreate",async interaction=>{
       if(!modeName || modeName.length > 40)
         return safeReply(interaction,{content:"❌ Mode ID must be 1–40 characters.",ephemeral:true});
 
-      const BUILTIN_MODES2 = new Set(["none","evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu","scottish","random"]);
+      const BUILTIN_MODES2 = new Set(["none","evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu","random"]);
       if(BUILTIN_MODES2.has(modeName))
         return safeReply(interaction,{content:`❌ \`${modeName}\` is a built-in mode and cannot be overwritten.`,ephemeral:true});
 
@@ -7485,8 +7897,8 @@ client.on("interactionCreate",async interaction=>{
   const cmd=interaction.commandName;
   const inGuild=!!interaction.guildId;
 
-  const ownerOnly=["servers","requester","deleter","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","echo","shadowdelete","clankerify","impersonation","thecount","send","fakemessage","fakequote","forcemarry","forcedivorce","paranoia","tempowner","blacklist","theremnant","betatesting"];
-  if(ownerOnly.includes(cmd)&&!isEffectiveOwner(interaction.user.id, cmd)&&!isBetaTesterAllowed(interaction.user.id, interaction.guildId, interaction.channelId, cmd))return safeReply(interaction,{content:"Owner only.",ephemeral:true});
+  const ownerOnly=["servers","requester","deleter","dmconfig","leaveserver","restart","refreshcmds","botstats","setstatus","adminconfig","echo","shadowdelete","clankerify","impersonation","thecount","send","fakemessage","fakequote","forcemarry","forcedivorce","paranoia","tempowner","blacklist","theremnant","jarvisenhance"];
+  if(ownerOnly.includes(cmd)&&!isEffectiveOwner(interaction.user.id, cmd))return safeReply(interaction,{content:"Owner only.",ephemeral:true});
 
   const manageServerCmds=["channelpicker","counting","xpconfig","setwelcome","setleave","setwelcomemsg","setleavemsg","disableownermsg","serverconfig","autorole","setboostmsg","invitecomp","purge","reactionrole","ticketsetup","ytsetup","subgoal","subcount","milestones","dailyquote","serverstats"];
   if(manageServerCmds.includes(cmd)){
@@ -7741,6 +8153,56 @@ if(cmd==="blacklist"){
   return safeReply(interaction,{...buildBlacklistPanel(token), ephemeral:true});
 }
 
+if(cmd==="jarvisenhance"){
+  const uid = interaction.user.id;
+  const action = interaction.options.getString("action");
+  const name = (interaction.options.getString("name")||"").trim().toLowerCase().replace(/\s+/g,"_");
+
+  if(action==="list"){
+    if(!jarvisEnhanceProfiles.size)
+      return safeReply(interaction,{content:"No Jarvis Enhance profiles yet. Use `/jarvisenhance action:create name:<id>` to make one.",ephemeral:true});
+    const lines = [...jarvisEnhanceProfiles.entries()].map(([id,p]) =>
+      `**${id}** ${p.ownerLocked===false ? "🔓" : "🔒"} — trigger word(s): ${p.triggers.map(t=>`\`${t}\``).join(" ")}\n${formatJarvisActionsList(p.actions)}`
+    );
+    return safeReply(interaction,{content:`**🧠 Jarvis Enhance Profiles (${jarvisEnhanceProfiles.size})**\n\n${lines.join("\n\n")}`,ephemeral:true});
+  }
+
+  if(action==="delete"){
+    if(!name) return safeReply(interaction,{content:"❌ Provide a `name`.",ephemeral:true});
+    if(!jarvisEnhanceProfiles.has(name)) return safeReply(interaction,{content:`❌ No profile named \`${name}\`.`,ephemeral:true});
+    return safeReply(interaction,{
+      content:`🗑️ Delete Jarvis Enhance profile \`${name}\`?`,
+      components:[new MessageActionRow().addComponents(
+        new MessageButton().setCustomId(`je_delconfirm_${name}`).setLabel("Delete").setStyle("DANGER"),
+        new MessageButton().setCustomId("je_delcancel").setLabel("Cancel").setStyle("SECONDARY"),
+      )],
+      ephemeral:true,
+    });
+  }
+
+  // create / edit — both open the same builder panel
+  if(!name) return safeReply(interaction,{content:"❌ Provide a `name` for this profile.",ephemeral:true});
+  const existing = jarvisEnhanceProfiles.get(name);
+  if(action==="create" && existing)
+    return safeReply(interaction,{content:`❌ A profile named \`${name}\` already exists — use \`action:edit\` to modify it.`,ephemeral:true});
+  if(action==="edit" && !existing)
+    return safeReply(interaction,{content:`❌ No profile named \`${name}\` — use \`action:create\` to make it.`,ephemeral:true});
+
+  const token = `${uid.slice(-6)}${Date.now().toString(36)}`;
+  jarvisEnhanceBuilders.set(token, {
+    ownerId: uid,
+    name,
+    triggers: existing ? [...existing.triggers] : [],
+    actions: existing ? existing.actions.map(a => ({ type:a.type, params:{...a.params} })) : [],
+    ownerLocked: existing ? existing.ownerLocked !== false : true,
+    selectedStep: null,
+    pendingActionType: null,
+  });
+  setTimeout(()=>jarvisEnhanceBuilders.delete(token), 15*60*1000);
+
+  return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+}
+
 if(cmd==="theremnant"){
   const text    = interaction.options.getString("message");
   const channel = interaction.channel;
@@ -7821,7 +8283,6 @@ if(cmd==="clankerify"){
     {label:"RespawnRaccoon Propaganda", value:"rr_propaganda", emoji:"🦝"},
     {label:"French",                    value:"french",       emoji:"🇫🇷"},
     {label:"UWU / LOLCAT",              value:"uwu",          emoji:"🐱"},
-    {label:"Scottish",                  value:"scottish",     emoji:"🏴󠁧󠁢󠁳󠁣󠁴󠁿"},
     {label:"Random (picks a random mode each message)", value:"random", emoji:"🎲"},
   ];
   const modeRow = new MessageActionRow().addComponents(
@@ -7964,49 +8425,6 @@ if(cmd==="send"){
 
   return safeReply(interaction,{
     content:[`📤 **Sent.** ${totalSent} message(s) delivered${totalFailed?`, ${totalFailed} failed (DMs likely closed)`:""} across ${channelsProcessed} channel(s).`,``,...summary].join("\n").slice(0,1900),
-    ephemeral:true,
-  });
-}
-
-if(cmd==="betatesting"){
-  if(!inGuild) return safeReply(interaction,{content:"Server only.",ephemeral:true});
-  const target = interaction.options.getUser("user");
-  const duration = interaction.options.getInteger("duration") ?? null; // minutes, null = permanent
-  const guildId = interaction.guildId;
-  const guild = interaction.guild;
-
-  let cfg = betaTestingConfigs.get(guildId);
-
-  if(duration === 0){
-    if(cfg) cfg.testers.delete(target.id);
-    saveData();
-    return safeReply(interaction,{content:`✅ Beta-testing access revoked for <@${target.id}>.`,ephemeral:true});
-  }
-  if(target.bot) return safeReply(interaction,{content:"❌ Can't grant beta-testing access to a bot.",ephemeral:true});
-  if(OWNER_IDS.includes(target.id)) return safeReply(interaction,{content:"❌ They're already an owner.",ephemeral:true});
-
-  // Create the category + 2 channels once per guild; reused on every later /betatesting run here
-  if(!cfg || !guild.channels.cache.has(cfg.categoryId)){
-    try{
-      const category = await guild.channels.create("🧪 Beta Testing", { type: "GUILD_CATEGORY" });
-      const ch1 = await guild.channels.create("beta-testing-1", { type:"GUILD_TEXT", parent: category.id });
-      const ch2 = await guild.channels.create("beta-testing-2", { type:"GUILD_TEXT", parent: category.id });
-      cfg = { categoryId: category.id, channelIds: [ch1.id, ch2.id], testers: new Map() };
-      betaTestingConfigs.set(guildId, cfg);
-    }catch(e){
-      console.error("[betatesting] category creation failed:", e.message);
-      return safeReply(interaction,{content:"❌ Couldn't create the beta-testing category — check the bot's permissions here.",ephemeral:true});
-    }
-  }
-
-  const expiresAt = duration ? Date.now() + duration*60000 : null;
-  cfg.testers.set(target.id, { expiresAt });
-  saveData();
-
-  const durationStr = duration ? `**${duration} minute(s)**` : "**permanently**";
-  const channelMentions = cfg.channelIds.map(id=>`<#${id}>`).join(" and ");
-  return safeReply(interaction,{
-    content:`🧪 <@${target.id}> can now use select owner commands (${BETA_TESTING_CMDS.map(c=>`\`/${c}\``).join(" ")}) in ${channelMentions} for ${durationStr}.`,
     ephemeral:true,
   });
 }
@@ -8275,9 +8693,9 @@ if(cmd==="divorce"){
         {title:"⚙️ Server Config  —  Page 3 / 8",description:["Most commands here require **Manage Server** permission.","","**Channels & Messages**","`/channelpicker channel:… [levelup]` — Set the bot's main channel","`/xpconfig setting:…` — Level-up messages (on/off, ping toggle, channel)","`/setwelcome channel:… [message]` — Welcome message (`{user}` `{server}` `{count}`)","`/setleave channel:… [message]` — Leave message","`/setboostmsg channel:… [message]` — Boost announcement","`/disableownermsg enabled:…` — Toggle bot owner broadcasts","`/purge amount:…` — Bulk delete (needs Manage Messages)","`/counting action:set|remove|status` — Set a permanent counting channel","","**Roles**","`/autorole [role]` — Auto-assign role on join (blank to disable)","`/reactionrole action:add|remove|list …` — Emoji reaction roles","`/rolespingfix` — List & fix roles that can @everyone","","**Competitions & Tickets**","`/invitecomp hours:…` — Invite competition with coin rewards","`/ticketsetup` · `/closeticket` · `/addtoticket` · `/removefromticket`","","**Overview**","`/serverconfig` — View all current settings"].join("\n")},
         {title:"🛡️ Activity & RA/LOA  —  Page 4 / 8",description:["**Activity Checks** *(Manage Server)*","`/activity-check channel:… [deadline] [message] [ping] [schedule]` — Send a check-in to staff","> Specify which roles must respond and who is excluded","> Auto-closes after the deadline and reports who didn't check in","> Add `schedule:Monday 09:00` (UTC) to repeat it weekly automatically","","**RA / LOA Setup** *(Manage Server)*","`/raconfig action:create` — Auto-create Reduced Activity + LOA roles","`/raconfig action:set_ra|set_loa role:…` — Use existing roles","`/raconfig action:view` — See current config","","**Assigning Roles**","`/staffrole type:ra|loa user:… action:give|remove [duration]` — Give/remove RA or LOA role","> `duration` is in hours — omit for permanent"].join("\n")},
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
-        {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🏴󠁧󠁢󠁳󠁣󠁴󠁿 Scottish · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
+        {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/betatesting user:… [duration]` — Grant channel-scoped access to select owner commands in a dedicated category","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word: say it while replying to run a chain of any bot action or Discord mod action (kick, ban, timeout, roles, nickname, DM, pin, delete, react, voice) in order","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const TOTAL=HELP_PAGES.length;
       function buildHelpEmbed(page){
@@ -8550,7 +8968,7 @@ if(cmd==="divorce"){
         let fakeContent=msgText||null;
 
         // ── Apply clankerify mode transforms ──────────────────────────────────
-        const FAKE_ALL_MODES=["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu","scottish"];
+        const FAKE_ALL_MODES=["evil","freaky","american","british","stupid","boomer","conspiracy","npc","sigma","medieval","ghost","pirate","rr_propaganda","french","uwu"];
         const resolvedFakeMode=(fakeMode==="random"||fakeMode==="none"||!fakeMode)
           ? (fakeMode==="random" ? FAKE_ALL_MODES[Math.floor(Math.random()*FAKE_ALL_MODES.length)] : null)
           : fakeMode;
@@ -8572,7 +8990,6 @@ if(cmd==="divorce"){
         else if(resolvedFakeMode==="rr_propaganda"){ const rs=[" By the way, go sub to RespawnRaccoon!"," By the way, go sub to RespawnRaccoon! Here's his YouTube link: https://www.youtube.com/@respawnraccoon"," On my momma if you ain't subbed to RespawnRaccoon..."," By the way, do you know RespawnRaccoon?"]; fakeContent=(fakeContent||"")+rs[Math.floor(Math.random()*rs.length)]; }
         else if(resolvedFakeMode==="french"){ fakeDisplayName=`${fakeDisplayName} 🇫🇷`; if(fakeContent){ const fs=[[/hello/gi,"bonjour"],[/hi/gi,"salut"],[/yes/gi,"oui"],[/yeah/gi,"oui oui"],[/no/gi,"non"],[/thanks/gi,"merci"],[/sorry/gi,"pardon"],[/good/gi,"magnifique"],[/friend/gi,"mon ami"],[/love/gi,"amour"],[/food/gi,"la cuisine"],[/wine/gi,"vin"]]; let t=fakeContent; for(const [f,r] of fs) t=t.replace(f,r); const fo=[" — c'est la vie 🥐"," — hon hon hon 🥖"," — sacré bleu!"," — voilà!"]; fakeContent=t+fo[Math.floor(Math.random()*fo.length)]; } else fakeContent="*shrugs elaborately* bof…"; }
         else if(resolvedFakeMode==="uwu"){ fakeDisplayName=`${fakeDisplayName} :3`; if(fakeContent){ const uw=[[/r/gi,"w"],[/l/gi,"w"],[/no/gi,"nyo"],[/yes/gi,"yesh"],[/the/gi,"da"],[/you/gi,"ewe"],[/what/gi,"wat"],[/hello/gi,"hewwo"],[/hi/gi,"hewwo"],[/sorry/gi,"sowwy"],[/!/g,"! UwU"],[/\?/g,"? :3"]]; let t=fakeContent; for(const [f,r] of uw) t=t.replace(f,r); const uo=["mrrp","  :3","  meow meow :3","  Nyah~!"]; fakeContent=t+"  "+uo[Math.floor(Math.random()*uo.length)]; } else fakeContent="*purrs* mrrp :3"; }
-        else if(resolvedFakeMode==="scottish"){ fakeDisplayName=`sco'ish ${fakeDisplayName} 'aye`; if(fakeContent){ let t=fakeContent.replace(/yes/gi,"aye").replace(/no/gi,"naw").replace(/friend/gi,"pal").replace(/man/gi,"lad").replace(/small/gi,"wee").replace(/very/gi,"pure").replace(/good/gi,"guid").replace(/bad/gi,"shite").replace(/cool/gi,"braw").replace(/hello/gi,"hullo").replace(/hi/gi,"awright").replace(/stupid/gi,"daft").replace(/crazy/gi,"mental"); const so=["  Where's me fockinʼ Iron Bru","  SCOTLAND FOREEVVVVVERRRRRRR","  Now fack off ya wee wanker"]; fakeContent=t+so[Math.floor(Math.random()*so.length)]; } else fakeContent="och aye the noo… *adjusts kilt*"; }
 
         const webhooks=await interaction.channel.fetchWebhooks();
         let webhook=webhooks.find(w=>w.owner?.id===CLIENT_ID);
@@ -9657,7 +10074,6 @@ if(cmd==="divorce"){
         {label:"RespawnRaccoon Propaganda", value:"rr_propaganda",    emoji:"🦝"},
         {label:"French",                    value:"french",           emoji:"🇫🇷"},
         {label:"UWU / LOLCAT",              value:"uwu",              emoji:"🐱"},
-        {label:"Scottish",                  value:"scottish",         emoji:"🏴󠁧󠁢󠁳󠁣󠁴󠁿"},
         {label:"Random (picks a random mode each message)", value:"random",   emoji:"🎲"},
       ];
       const selfclankComponents = [new MessageActionRow().addComponents(
