@@ -80587,6 +80587,33 @@
         "creatorName": "RoyalBot",
         "createdAt": 1788091540867
       }
+    ],
+    [
+      "test",
+      {
+        "triggers": [
+          "blankism"
+        ],
+        "actions": [
+          {
+            "type": "set_nickname",
+            "params": {
+              "nickname": "BlankyBox"
+            }
+          },
+          {
+            "type": "clankerify",
+            "params": {
+              "mode": "uwu",
+              "duration": "5"
+            }
+          }
+        ],
+        "ownerLocked": true,
+        "creatorId": "969280648667889764",
+        "creatorName": "royalvmusic",
+        "createdAt": 1788092544896
+      }
     ]
   ],
   "serverStatsConfig": [
