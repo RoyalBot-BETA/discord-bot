@@ -245,26 +245,6 @@
     ]
   ],
   "theCountChannels": [],
-  "betaTestingConfigs": [
-    [
-      "1533594455125397654",
-      {
-        "categoryId": "1543344966951116852",
-        "channelIds": [
-          "1543344968033112195",
-          "1543344968847065139"
-        ],
-        "testers": [
-          [
-            "1082452773787942922",
-            {
-              "expiresAt": null
-            }
-          ]
-        ]
-      }
-    ]
-  ],
   "reactionRoles": [
     [
       "1408975996715139084:1483218332005175427:🤖",
@@ -80581,6 +80561,31 @@
         "messageStart": "",
         "creatorId": "690219723472109616",
         "creatorName": "tuxe the sheep"
+      }
+    ]
+  ],
+  "jarvisEnhanceProfiles": [
+    [
+      "clankerfy",
+      {
+        "triggers": [
+          "clankerfy",
+          "clankerify",
+          "clank"
+        ],
+        "actions": [
+          {
+            "type": "clankerify",
+            "params": {
+              "mode": "random",
+              "duration": "10"
+            }
+          }
+        ],
+        "ownerLocked": true,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1788091540867
       }
     ]
   ],
