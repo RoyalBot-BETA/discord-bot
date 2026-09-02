@@ -58789,8 +58789,13 @@
     [
       "1544663280914661556",
       "IMG_4445.png"
+    ],
+    [
+      "1544846228725174394",
+      "56dd0b8a-5d88-4f67-b4ab-e5ef1c0574bb.webp"
     ]
   ],
+  "favoritedQuotes": [],
   "reviewChannelId": "1533778635373281421",
   "deleterChannelId": "1533778596387356672",
   "trashcanThreshold": 1,
@@ -80339,6 +80344,17 @@
         "sentToDeleter": false,
         "type": "quote"
       }
+    ],
+    [
+      "1544846228725174394",
+      {
+        "filename": "56dd0b8a-5d88-4f67-b4ab-e5ef1c0574bb.webp",
+        "voters": [],
+        "guildId": "1533594455125397654",
+        "channelId": "1533606778112053478",
+        "sentToDeleter": false,
+        "type": "quote"
+      }
     ]
   ],
   "selfClankUsers": [
@@ -80624,6 +80640,25 @@
         "creatorId": "system",
         "creatorName": "RoyalBot",
         "createdAt": 1788091540867
+      }
+    ],
+    [
+      "hitaclip",
+      {
+        "triggers": [
+          "quote",
+          "clip"
+        ],
+        "actions": [
+          {
+            "type": "random_quote",
+            "params": {}
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "system",
+        "creatorName": "RoyalBot",
+        "createdAt": 1788390433710
       }
     ],
     [
