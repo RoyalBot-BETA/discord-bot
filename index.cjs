@@ -42,7 +42,7 @@ const ffmpegPath = require("ffmpeg-static");
 })();
 
 const TOKEN     = process.env.TOKEN;
-const CLIENT_ID = "1533598420504412261";
+const CLIENT_ID = "1480592876684706064";
 const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
 const OWNER_ID  = OWNER_IDS[1];
 const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
@@ -309,6 +309,34 @@ let quoteFetching = false; // true while a refill fetch is in flight
 const quoteVotes = new Map();
 // quoteVoteMessages: messageId -> filename  (tracks which quote a message shows)
 const quoteVoteMessages = new Map();
+
+// favoritedQuotes: userId -> Set<filename> — Patreon-exclusive quote favorites.
+const favoritedQuotes = new Map();
+
+// ⚠️ NEEDS V's INPUT — see chat. These two are placeholders until filled in:
+//   PATREON_GUILD_ID: the Discord server ID where the Patreon role IDs below
+//     actually live (checked via a cross-guild member fetch, since roles are
+//     per-server and this command can be run from any server the bot is in).
+//   PATREON_LINK: the actual Patreon URL for the error message.
+// Until both are set, isPatreonMember() always returns false (fails safe —
+// nobody gets access rather than everybody).
+const PATREON_GUILD_ID = "1533594455125397654";
+const PATREON_LINK = "https://www.patreon.com/c/RoyalV_/membership";
+const PATREON_ROLE_IDS = [
+  "1544836879898386532",
+  "1542615345162887248",
+  "1542615386053156954",
+  "1542615428264894555",
+  "1542615456492552334",
+];
+async function isPatreonMember(userId) {
+  if (!PATREON_GUILD_ID) return false;
+  const guild = client.guilds.cache.get(PATREON_GUILD_ID);
+  if (!guild) return false;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return false;
+  return PATREON_ROLE_IDS.some(rid => member.roles.cache.has(rid));
+}
 let reviewChannelId = null; // global channel ID for quote review submissions
 let deleterChannelId = null; // global channel ID where trashcan-flagged quotes are sent for reevaluation
 // quoteUserVotes: filename → Map<userId, 'up'|'down'>  (in-session tracking, prevents double-vote per session)
@@ -640,13 +668,12 @@ function buildBlacklistPanel(token){
 // ── /jarvisenhance — customizable Jarvis automation chains ─────────────────────
 // A "profile" is a named, owner-built macro: one or more trigger words (matched
 // the exact same way as the Jarvis image trigger — tokenized whole-word match,
-// not loose substring) plus an ordered list of actions to run in sequence
-// against the message being replied to when someone says "Jarvis, <word>" or
-// "RoyalBot, <word>" as a reply. Every action here is a real, existing owner
-// capability of the bot (Discord-side and coded-in) — this just lets them be
-// chained, reordered, and fired by voice-style command instead of typed one at
-// a time.
-// jarvisEnhanceProfiles: name -> { triggers:[word,...], actions:[{type,params}], creatorId, creatorName, createdAt }
+// not loose substring) plus an ordered list of actions to run in sequence when
+// someone says "Jarvis, <word>" or "RoyalBot, <word>" as a reply. Any leftover
+// text after the trigger word (e.g. "Jarvis, dm stop that") is available to the
+// first dynamic-eligible action as free text, so a single word + custom text
+// works like a live command, not just a fixed macro.
+// jarvisEnhanceProfiles: name -> { triggers:[word,...], actions:[{type,params}], ownerLocked, creatorId, creatorName, createdAt }
 const jarvisEnhanceProfiles = new Map();
 // Seed the example from the spec — "Jarvis, clankerfy him" while replying picks
 // a random personality mode. Loaded save data (below) overwrites this if the
@@ -659,79 +686,168 @@ jarvisEnhanceProfiles.set("clankerfy", {
   creatorName: "RoyalBot",
   createdAt: Date.now(),
 });
-// jarvisEnhanceBuilders: token -> { ownerId, name, triggers:[...], actions:[...], selectedStep:number|null, pendingActionType:string|null }
+// "Jarvis, [quote/clip anywhere in the message]" → random quote, same as
+// /quote (with the vote buttons). Single-word triggers, whole-word matched
+// regardless of position — "Jarvis, got a clip?" or "Jarvis, quote" both fire
+// it. Doesn't need a reply — /quote itself isn't owner-restricted, so this
+// isn't either.
+jarvisEnhanceProfiles.set("hitaclip", {
+  triggers: ["quote", "clip"],
+  actions: [{ type:"random_quote", params:{} }],
+  ownerLocked: false,
+  creatorId: "system",
+  creatorName: "RoyalBot",
+  createdAt: Date.now(),
+});
+// jarvisEnhanceBuilders: token -> { ownerId, name, triggers, actions, ownerLocked,
+//   category (currently browsed category or null), selectedStep, pendingActionType, pendingMode }
 const jarvisEnhanceBuilders = new Map();
 
-// Every action available to /jarvisenhance. `needs` tells the runner what
-// context the step requires: "user" = the author of the replied-to message,
-// "message" = the replied-to message itself, "channel" = just the channel the
-// trigger was said in. `fields` become a Discord modal (max 5 fields/modal;
-// every action here uses 0–2) when the owner adds that action to a profile.
-const JARVISENHANCE_ACTIONS = [
-  { id:"clankerify", emoji:"🤖", label:"Clankerify", needs:"user", fields:[
-    { key:"mode", label:"Mode (blank=none; random, evil, freaky, american, british, stupid, boomer, conspiracy, npc, sigma, medieval, ghost, pirate, rr_propaganda, french, uwu, or a /clankerbuild custom mode id)", style:2, required:false, max:60 },
-    { key:"duration", label:"Duration in minutes (blank=permanent, 0=disable)", style:1, required:false, max:10 },
-  ]},
-  { id:"impersonation", emoji:"🎭", label:"Impersonation", needs:"user", fields:[
-    { key:"mode", label:"Mode (blank=none; same options as Clankerify)", style:2, required:false, max:60 },
-    { key:"duration", label:"Duration in minutes (blank=permanent, 0=disable)", style:1, required:false, max:10 },
-  ]},
-  { id:"shadowdelete", emoji:"👻", label:"Shadow Delete", needs:"user", fields:[
-    { key:"percentage", label:"Delete chance % (0-100, 0=disable)", style:1, required:true, max:3 },
-  ]},
-  { id:"paranoia", emoji:"😱", label:"Paranoia (toggle)", needs:"user", fields:[
-    { key:"chance", label:"Reply chance % (1-100, blank=100)", style:1, required:false, max:3 },
-  ]},
-  { id:"clank_this", emoji:"⚡", label:"Quick Clank (10 min, plain)", needs:"user", fields:[] },
-  { id:"reaction_bomb", emoji:"💣", label:"Reaction Bomb", needs:"message", fields:[] },
-  { id:"expose", emoji:"🚨", label:"Expose", needs:"message", fields:[] },
-  { id:"jarvis_image", emoji:"🖼️", label:"Random Jarvis Image", needs:"message", fields:[] },
-  { id:"forcedivorce", emoji:"💔", label:"Force Divorce", needs:"user", fields:[] },
-  { id:"forcemarry", emoji:"💍", label:"Force Marry (to a 2nd user)", needs:"user", fields:[
-    { key:"user2", label:"Second user — @mention or user ID", style:1, required:true, max:40 },
-  ]},
-  { id:"fakequote", emoji:"🗨️", label:"Fake Quote Card", needs:"user", fields:[
-    { key:"text", label:"Quote text", style:2, required:true, max:300 },
-  ]},
-  { id:"echo", emoji:"📢", label:"Echo (say something)", needs:"channel", fields:[
-    { key:"message", label:"Message text", style:2, required:true, max:1000 },
-  ]},
-  { id:"theremnant", emoji:"👁️", label:"The Remnant Transmission", needs:"channel", fields:[
-    { key:"message", label:"Transmission text", style:2, required:true, max:1000 },
-  ]},
+// Categories split strictly by whether the action needs the reply target
+// (the user/message being replied to) or not. clanker/mod/message all act on
+// the reply target; broadcast actions run in the channel/bot itself and
+// ignore whatever was replied to (a reply is still required to say the
+// trigger word — the wake system doesn't work without one — the action
+// itself just doesn't use the target).
+const JARVISENHANCE_CATEGORIES = [
+  { id:"clanker",   label:"🤖 Clankerify & Impersonation", needsTarget:true },
+  { id:"mod",       label:"🔨 Moderation",                 needsTarget:true },
+  { id:"message",   label:"💬 Messaging & Fun",             needsTarget:true },
+  { id:"broadcast", label:"📢 Broadcast / Bot (no target needed)", needsTarget:false },
+];
 
-  // ── Raw Discord moderation/admin actions — not wrapped by any existing slash
-  // command, called straight against the Discord API against the reply target.
-  { id:"kick", emoji:"👢", label:"Kick", needs:"member", fields:[
-    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+// Modes offered for Clankerify/Impersonation — point-and-click only, no typing.
+// Community modes from /clankerbuild are appended at render time.
+const JARVIS_MODE_OPTIONS_BASE = [
+  {label:"No mode (plain)",  value:"none",        emoji:"🤖"},
+  {label:"Evil",             value:"evil",        emoji:"😈"},
+  {label:"Freaky",           value:"freaky",      emoji:"😏"},
+  {label:"American",         value:"american",    emoji:"🦅"},
+  {label:"British",          value:"british",     emoji:"🫖"},
+  {label:"Stupid",           value:"stupid",      emoji:"🪖"},
+  {label:"Boomer",           value:"boomer",      emoji:"📰"},
+  {label:"Conspiracy",       value:"conspiracy",  emoji:"🔺"},
+  {label:"NPC",              value:"npc",         emoji:"🗺️"},
+  {label:"Sigma",            value:"sigma",       emoji:"😤"},
+  {label:"Medieval",         value:"medieval",    emoji:"⚔️"},
+  {label:"Ghost",            value:"ghost",       emoji:"👻"},
+  {label:"Pirate",           value:"pirate",      emoji:"🏴‍☠️"},
+  {label:"RespawnRaccoon Propaganda", value:"rr_propaganda", emoji:"🦝"},
+  {label:"French",                    value:"french",       emoji:"🇫🇷"},
+  {label:"UWU / LOLCAT",              value:"uwu",          emoji:"🐱"},
+  {label:"Random (picks a random mode each run)", value:"random", emoji:"🎲"},
+];
+function buildJarvisModeOptions(){
+  const community = [...customClankerModes.entries()].slice(0, 7).map(([id, m]) => ({
+    label: `${m.emoji||"⭐"} ${id}`.slice(0,100), value:id,
+  }));
+  return [...JARVIS_MODE_OPTIONS_BASE, ...community].slice(0, 25);
+}
+const JARVIS_DURATION_OPTIONS = [
+  {label:"Permanent",  value:"permanent", emoji:"♾️"},
+  {label:"5 minutes",  value:"5",         emoji:"⏱️"},
+  {label:"10 minutes", value:"10",        emoji:"⏱️"},
+  {label:"30 minutes", value:"30",        emoji:"⏱️"},
+  {label:"1 hour",     value:"60",        emoji:"⏱️"},
+  {label:"3 hours",    value:"180",       emoji:"⏱️"},
+  {label:"Disable",    value:"disable",   emoji:"🛑"},
+];
+
+// Every action available to /jarvisenhance, grouped by category (above).
+// `needs` documents what context the step uses: "user"/"member"/"message" all
+// require the reply target; "channel"/"none" don't. `dynamicField`, if set, is
+// the field that falls back to whatever text follows the trigger word in chat
+// when left blank in the builder (e.g. "Jarvis, dm stop that" → message:"stop
+// that" even though the profile itself was saved with no message set).
+// `fields` become a Discord modal (max 5 fields; every action here uses 0–2).
+// Clankerify/Impersonation skip modals entirely — their mode+duration are
+// chosen through point-and-click select menus instead (see the builder below).
+const JARVISENHANCE_ACTIONS = [
+  // ── Clankerify & Impersonation — mode+duration picked via select, no typing ──
+  { id:"clankerify", category:"clanker", emoji:"🤖", label:"Clankerify", needs:"user", fields:[] },
+  { id:"impersonation", category:"clanker", emoji:"🎭", label:"Impersonation", needs:"user", fields:[] },
+  { id:"clank_this", category:"clanker", emoji:"⚡", label:"Quick Clank (10 min, plain)", needs:"user", fields:[] },
+
+  // ── Moderation ────────────────────────────────────────────────────────────
+  { id:"shadowdelete", category:"mod", emoji:"👻", label:"Shadow Delete", needs:"user", dynamicField:"percentage", fields:[
+    { key:"percentage", label:"Delete chance % (blank=uses text after trigger word)", style:1, required:false, max:3 },
   ]},
-  { id:"ban", emoji:"🔨", label:"Ban", needs:"member", fields:[
-    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+  { id:"paranoia", category:"mod", emoji:"😱", label:"Paranoia (toggle)", needs:"user", dynamicField:"chance", fields:[
+    { key:"chance", label:"Reply chance % (blank=uses text after trigger word, else 100)", style:1, required:false, max:3 },
+  ]},
+  { id:"kick", category:"mod", emoji:"👢", label:"Kick", needs:"member", dynamicField:"reason", fields:[
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
+  ]},
+  { id:"ban", category:"mod", emoji:"🔨", label:"Ban", needs:"member", dynamicField:"reason", fields:[
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
     { key:"deleteDays", label:"Delete message history — days, 0-7 (blank=0)", style:1, required:false, max:1 },
   ]},
-  { id:"timeout", emoji:"⏱️", label:"Timeout", needs:"member", fields:[
+  { id:"timeout", category:"mod", emoji:"⏱️", label:"Timeout", needs:"member", dynamicField:"reason", fields:[
     { key:"duration", label:"Duration in minutes (max 40320 / 28 days)", style:1, required:true, max:6 },
-    { key:"reason", label:"Reason (optional)", style:1, required:false, max:200 },
+    { key:"reason", label:"Reason (blank=uses text after trigger word)", style:1, required:false, max:200 },
   ]},
-  { id:"remove_timeout", emoji:"🔓", label:"Remove Timeout", needs:"member", fields:[] },
-  { id:"add_role", emoji:"➕", label:"Add Role", needs:"member", fields:[
-    { key:"role", label:"Role name or ID", style:1, required:true, max:100 },
+  { id:"remove_timeout", category:"mod", emoji:"🔓", label:"Remove Timeout", needs:"member", fields:[] },
+  { id:"add_role", category:"mod", emoji:"➕", label:"Add Role", needs:"member", dynamicField:"role", fields:[
+    { key:"role", label:"Role name or ID (blank=uses text after trigger word)", style:1, required:false, max:100 },
   ]},
-  { id:"remove_role", emoji:"➖", label:"Remove Role", needs:"member", fields:[
-    { key:"role", label:"Role name or ID", style:1, required:true, max:100 },
+  { id:"remove_role", category:"mod", emoji:"➖", label:"Remove Role", needs:"member", dynamicField:"role", fields:[
+    { key:"role", label:"Role name or ID (blank=uses text after trigger word)", style:1, required:false, max:100 },
   ]},
-  { id:"set_nickname", emoji:"✏️", label:"Set Nickname", needs:"member", fields:[
-    { key:"nickname", label:"New nickname (blank=reset to username)", style:1, required:false, max:32 },
+  { id:"set_nickname", category:"mod", emoji:"✏️", label:"Set Nickname", needs:"member", dynamicField:"nickname", fields:[
+    { key:"nickname", label:"New nickname (blank=uses text after trigger word)", style:1, required:false, max:32 },
   ]},
-  { id:"dm_user", emoji:"✉️", label:"DM the User", needs:"user", fields:[
-    { key:"message", label:"Message text", style:2, required:true, max:1500 },
+  { id:"voice_disconnect", category:"mod", emoji:"🔇", label:"Disconnect from Voice", needs:"member", fields:[] },
+  { id:"queue_open", category:"mod", emoji:"📥", label:"Open Queue Channel (/thecount)", needs:"user", fields:[] },
+
+  // ── Messaging & Fun — all act on the reply target ────────────────────────────
+  { id:"dm_user", category:"message", emoji:"✉️", label:"DM the User", needs:"user", dynamicField:"message", fields:[
+    { key:"message", label:"Message text (blank=uses text after trigger word)", style:2, required:false, max:1500 },
   ]},
-  { id:"pin_message", emoji:"📌", label:"Pin the Message", needs:"message", fields:[] },
-  { id:"delete_message", emoji:"🗑️", label:"Delete the Message", needs:"message", fields:[] },
-  { id:"add_reaction", emoji:"🙂", label:"React to the Message", needs:"message", fields:[
-    { key:"emoji", label:"Emoji (unicode, or custom ID like name:id)", style:1, required:true, max:100 },
+  { id:"fakequote", category:"message", emoji:"🗨️", label:"Fake Quote Card", needs:"user", dynamicField:"text", fields:[
+    { key:"text", label:"Quote text (blank=uses text after trigger word)", style:2, required:false, max:300 },
   ]},
-  { id:"voice_disconnect", emoji:"🔇", label:"Disconnect from Voice", needs:"member", fields:[] },
+  { id:"pin_message", category:"message", emoji:"📌", label:"Pin the Message", needs:"message", fields:[] },
+  { id:"delete_message", category:"message", emoji:"🗑️", label:"Delete the Message", needs:"message", fields:[] },
+  { id:"add_reaction", category:"message", emoji:"🙂", label:"React to the Message", needs:"message", dynamicField:"emoji", fields:[
+    { key:"emoji", label:"Emoji (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"jarvis_image", category:"message", emoji:"🖼️", label:"Random Jarvis Image", needs:"message", fields:[] },
+  { id:"reaction_bomb", category:"message", emoji:"💣", label:"Reaction Bomb", needs:"message", fields:[] },
+  { id:"expose", category:"message", emoji:"🚨", label:"Expose", needs:"message", fields:[] },
+  { id:"forcemarry", category:"message", emoji:"💍", label:"Force Marry (to a 2nd user)", needs:"user", dynamicField:"user2", fields:[
+    { key:"user2", label:"Second user — @mention/ID (blank=uses text after trigger word)", style:1, required:false, max:40 },
+  ]},
+  { id:"forcedivorce", category:"message", emoji:"💔", label:"Force Divorce", needs:"user", fields:[] },
+  { id:"propose_marriage", category:"message", emoji:"💌", label:"Propose Marriage (from you, to them)", needs:"user", fields:[] },
+  { id:"show_avatar", category:"message", emoji:"🖼️", label:"Show Avatar", needs:"user", fields:[] },
+  { id:"give_xp", category:"message", emoji:"⭐", label:"Give/Take XP", needs:"user", dynamicField:"amount", fields:[
+    { key:"amount", label:"XP amount, +/- (blank=uses text after trigger word)", style:1, required:false, max:8 },
+  ]},
+
+  // ── Broadcast / Bot — no reply target used unless "Reply to the message" is picked ──
+  { id:"echo", category:"broadcast", emoji:"📢", label:"Echo (say something)", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"message", label:"Message text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"send_embed", category:"broadcast", emoji:"🧾", label:"Send an Embed", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"title", label:"Embed title (optional)", style:1, required:false, max:256 },
+    { key:"message", label:"Embed text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"theremnant", category:"broadcast", emoji:"👁️", label:"The Remnant Transmission", needs:"channel", dynamicField:"message", replyable:true, fields:[
+    { key:"message", label:"Transmission text (blank=uses text after trigger word)", style:2, required:false, max:1000 },
+  ]},
+  { id:"purge", category:"broadcast", emoji:"🧹", label:"Purge Messages", needs:"channel", dynamicField:"amount", fields:[
+    { key:"amount", label:"How many messages, 1-100 (blank=uses text after trigger word)", style:1, required:false, max:3 },
+  ]},
+  { id:"setstatus", category:"broadcast", emoji:"🎮", label:"Set Bot Status", needs:"none", dynamicField:"text", fields:[
+    { key:"text", label:"Status text (blank=uses text after trigger word)", style:1, required:false, max:100 },
+  ]},
+  { id:"set_reminder", category:"broadcast", emoji:"⏰", label:"Set a Reminder (for you)", needs:"channel", dynamicField:"message", fields:[
+    { key:"minutes", label:"Minutes from now (1-10080)", style:1, required:true, max:6 },
+    { key:"message", label:"Reminder text (blank=uses text after trigger word)", style:2, required:false, max:500 },
+  ]},
+  { id:"random_quote", category:"broadcast", emoji:"💬", label:"Random Quote (like /quote)", needs:"channel", fields:[] },
+  { id:"random_good_quote", category:"broadcast", emoji:"👍", label:"Random Good Quote (like /goodquote)", needs:"channel", fields:[] },
+  { id:"random_bad_quote", category:"broadcast", emoji:"👎", label:"Random Bad Quote (like /badquote)", needs:"channel", fields:[] },
 ];
 
 function formatJarvisActionsList(actions){
@@ -745,12 +861,21 @@ function formatJarvisActionsList(actions){
 
 function buildJarvisEnhancePanel(token){
   const b = jarvisEnhanceBuilders.get(token);
-  const actionOptions = JARVISENHANCE_ACTIONS.map(a => ({ label:`${a.emoji} ${a.label}`, value:a.id }));
-  const rows = [
-    new MessageActionRow().addComponents(
-      new MessageSelectMenu().setCustomId(`je_addtype_${token}`).setPlaceholder("➕ Add an action…").setOptions(actionOptions)
-    ),
-  ];
+  const rows = [];
+
+  if(!b.category){
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_category_${token}`).setPlaceholder("➕ Add an action — pick a category…")
+        .setOptions(JARVISENHANCE_CATEGORIES.map(c => ({ label:c.label, value:c.id })))
+    ));
+  } else {
+    const cat = JARVISENHANCE_CATEGORIES.find(c => c.id===b.category);
+    const opts = JARVISENHANCE_ACTIONS.filter(a => a.category===b.category).map(a => ({ label:`${a.emoji} ${a.label}`, value:a.id }));
+    rows.push(new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_addtype_${token}`).setPlaceholder(`${cat.label} — pick an action…`).setOptions(opts)
+    ));
+  }
+
   if(b.actions.length){
     const stepOptions = b.actions.map((a,i) => {
       const def = JARVISENHANCE_ACTIONS.find(x => x.id === a.type);
@@ -765,18 +890,24 @@ function buildJarvisEnhancePanel(token){
     new MessageButton().setCustomId(`je_movedown_${token}`).setLabel("🔽 Move Down").setStyle("SECONDARY").setDisabled(b.selectedStep===null || b.selectedStep===b.actions.length-1),
     new MessageButton().setCustomId(`je_removestep_${token}`).setLabel("🗑️ Remove Step").setStyle("DANGER").setDisabled(b.selectedStep===null),
   ));
-  rows.push(new MessageActionRow().addComponents(
+
+  const bottomButtons = [
     new MessageButton().setCustomId(`je_triggers_${token}`).setLabel("✏️ Set Trigger Word(s)").setStyle("PRIMARY"),
     new MessageButton().setCustomId(`je_ownerlock_${token}`).setLabel(b.ownerLocked ? "🔒 Owner Locked: ON" : "🔓 Owner Locked: OFF").setStyle(b.ownerLocked ? "DANGER" : "SECONDARY"),
     new MessageButton().setCustomId(`je_save_${token}`).setLabel("✅ Save Profile").setStyle("SUCCESS").setDisabled(!b.triggers.length || !b.actions.length),
-    new MessageButton().setCustomId(`je_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
-  ));
+  ];
+  if(b.category){
+    bottomButtons.unshift(new MessageButton().setCustomId(`je_addback_${token}`).setLabel("◀ Categories").setStyle("SECONDARY"));
+  } else {
+    bottomButtons.push(new MessageButton().setCustomId(`je_cancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"));
+  }
+  rows.push(new MessageActionRow().addComponents(...bottomButtons));
 
   const content = [
     `🧠 **Jarvis Enhance** — configuring \`${b.name}\``,
     ``,
     `**Trigger word(s):** ${b.triggers.length ? b.triggers.map(t=>`\`${t}\``).join(" ") : "_none set_"}`,
-    `_Works just like the Jarvis image trigger: reply to a message and say "Jarvis, <word>" or "RoyalBot, <word>" — same whole-word matching._`,
+    `_Reply to a message and say "Jarvis, <word>" or "RoyalBot, <word>" to run it. Whole-word match, same as the Jarvis image trigger. Any text you leave blank on a "blank=uses text after trigger word" field is filled in live from whatever you type after the trigger word — e.g. "Jarvis, dm knock it off"._`,
     b.ownerLocked
       ? `🔒 **Owner Locked** — only the owner (or someone granted this via \`/tempowner\`) can fire this trigger.`
       : `🔓 **Owner Locked is OFF** — anyone in the server can fire this trigger by saying the word.`,
@@ -788,10 +919,62 @@ function buildJarvisEnhancePanel(token){
   return { content, components: rows };
 }
 
+function buildJarvisModePicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickmode_${token}`).setPlaceholder("Pick a mode…").setOptions(buildJarvisModeOptions())
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"🤖"} **${def?.label||b.pendingActionType}** — pick a mode:`, components:rows };
+}
+
+function buildJarvisDurationPicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickduration_${token}`).setPlaceholder("Pick a duration…").setOptions(JARVIS_DURATION_OPTIONS)
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"🤖"} **${def?.label||b.pendingActionType}** — mode: \`${b.pendingMode}\`. Now pick a duration:`, components:rows };
+}
+
+// Actions that send text into the channel (echo/send_embed/theremnant) can
+// optionally reply to the message you're replying to instead of just posting
+// normally — a pick-from-a-list choice, no typing. Picking "Reply" is what
+// makes that specific action step require the trigger to be said as a reply;
+// "Send normally" means it never needs one.
+function buildJarvisReplyModePicker(token){
+  const b = jarvisEnhanceBuilders.get(token);
+  const def = JARVISENHANCE_ACTIONS.find(a => a.id===b.pendingActionType);
+  const rows = [
+    new MessageActionRow().addComponents(
+      new MessageSelectMenu().setCustomId(`je_pickreply_${token}`).setPlaceholder("How should this be sent?").setOptions([
+        { label:"💬 Reply to the message you're replying to", value:"reply", emoji:"💬" },
+        { label:"📢 Send normally (doesn't need you to be replying)", value:"normal", emoji:"📢" },
+      ])
+    ),
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`je_addcancel_${token}`).setLabel("Cancel").setStyle("SECONDARY"),
+    ),
+  ];
+  return { content:`${def?.emoji||"📢"} **${def?.label||b.pendingActionType}** — how should it be sent?`, components:rows };
+}
+
 // Executes one saved profile's action chain in order against the resolved
 // context. Each runner mirrors the exact logic of the equivalent existing
 // owner command/context-menu action, just invoked directly instead of through
-// a slash command interaction.
+// a slash command interaction. If an action has a `dynamicField` and it was
+// left blank when the profile was built, whatever text followed the trigger
+// word at runtime (ctx.restText) fills it in live.
 const JARVISENHANCE_RUNNERS = {
   async clankerify(params, ctx){
     const dur = (params.duration||"").trim();
@@ -811,6 +994,13 @@ const JARVISENHANCE_RUNNERS = {
     saveData();
     return `set${mode?` (${mode})`:""}`;
   },
+  async clank_this(params, ctx){
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    clankerify.set(ctx.targetUser.id, { expiresAt: Date.now() + 10*60000, mode:null, ownerClanked:true });
+    saveData();
+    setTimeout(() => { clankerify.delete(ctx.targetUser.id); saveData(); }, 10*60000);
+    return "10 min";
+  },
   async shadowdelete(params, ctx){
     const pct = Math.max(0, Math.min(100, parseInt(params.percentage,10)||0));
     if(pct===0){ shadowDelete.delete(ctx.targetUser.id); saveData(); return "disabled"; }
@@ -825,79 +1015,6 @@ const JARVISENHANCE_RUNNERS = {
     saveData();
     return `armed (${chance}%)`;
   },
-  async clank_this(params, ctx){
-    if(ctx.targetUser.bot) return "skipped (bot)";
-    clankerify.set(ctx.targetUser.id, { expiresAt: Date.now() + 10*60000, mode:null, ownerClanked:true });
-    saveData();
-    setTimeout(() => { clankerify.delete(ctx.targetUser.id); saveData(); }, 10*60000);
-    return "10 min";
-  },
-  async reaction_bomb(params, ctx){
-    const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
-    for(const emoji of BOMB_EMOJIS){ await ctx.targetMsg.react(emoji).catch(()=>{}); }
-    return "done";
-  },
-  async expose(params, ctx){
-    const content = ctx.targetMsg.content || "(no text)";
-    const exposePrefixes = ["🚨 CAUGHT IN 4K:","📢 ATTENTION EVERYONE:","🔍 EXPOSE THREAD:","📸 SCREENSHOT THIS:","⚠️ EVIDENCE:"];
-    const prefix = exposePrefixes[Math.floor(Math.random()*exposePrefixes.length)];
-    await ctx.channel.send({ content:`${prefix}\n> ${content}\n— <@${ctx.targetUser.id}>` }).catch(()=>{});
-    return "done";
-  },
-  async jarvis_image(params, ctx){
-    const imgs = await getJarvisImages();
-    if(!imgs.length) return "no images";
-    const pick = imgs[Math.floor(Math.random()*imgs.length)];
-    await ctx.targetMsg.reply({ files:[pick.download_url], allowedMentions:{repliedUser:false} }).catch(()=>{});
-    return pick.word;
-  },
-  async forcedivorce(params, ctx){
-    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
-    if(!s.marriedTo) return "not married";
-    const partner = scores.get(s.marriedTo);
-    if(partner){ partner.marriedTo=null; partner.pendingProposal=null; partner.forceMarried=false; }
-    s.marriedTo=null; s.pendingProposal=null; s.forceMarried=false;
-    saveData();
-    return "done";
-  },
-  async forcemarry(params, ctx){
-    const idMatch = (params.user2||"").match(/\d{15,20}/);
-    if(!idMatch) return "no valid user2";
-    const u2 = await client.users.fetch(idMatch[0]).catch(()=>null);
-    if(!u2) return "user2 not found";
-    if(u2.id === ctx.targetUser.id) return "skipped (same user)";
-    const s1 = getScore(ctx.targetUser.id, ctx.targetUser.username);
-    const s2 = getScore(u2.id, u2.username);
-    if(s1.marriedTo || s2.marriedTo) return "already married";
-    s1.marriedTo=u2.id; s1.pendingProposal=null; s1.forceMarried=true;
-    s2.marriedTo=ctx.targetUser.id; s2.pendingProposal=null; s2.forceMarried=true;
-    saveData();
-    return "done";
-  },
-  async fakequote(params, ctx){
-    try{
-      const displayName = ctx.targetUser.username;
-      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
-      const avatarRes = await fetch(avatarURL);
-      if(!avatarRes.ok) return "avatar fetch failed";
-      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
-      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: params.text||"", displayName, username: displayName });
-      await ctx.channel.send({ files:[{ attachment: cardBuffer, name:"quote_6660.png" }] }).catch(()=>{});
-      return "done";
-    }catch(e){ return `error: ${e.message}`; }
-  },
-  async echo(params, ctx){
-    await ctx.channel.send({ content:(params.message||"").slice(0,2000), allowedMentions:{parse:[]} }).catch(()=>{});
-    return "done";
-  },
-  async theremnant(params, ctx){
-    await ctx.channel.send({
-      embeds:[{ title:"👁️ The Remnant", description:(params.message||"").slice(0,1000), color:0x8E44AD, footer:{text:"A signal from somewhere else…"}, timestamp:new Date().toISOString() }],
-    }).catch(()=>{});
-    return "done";
-  },
-
-  // ── Raw Discord moderation/admin runners ────────────────────────────────────
   async kick(params, ctx){
     if(!ctx.targetMember) return "not in server";
     if(!ctx.targetMember.kickable) return "cannot kick (permissions/hierarchy)";
@@ -946,9 +1063,32 @@ const JARVISENHANCE_RUNNERS = {
     await ctx.targetMember.setNickname(params.nickname || null);
     return params.nickname ? `set to "${params.nickname}"` : "reset";
   },
+  async voice_disconnect(params, ctx){
+    if(!ctx.targetMember || !ctx.targetMember.voice?.channel) return "not in voice";
+    await ctx.targetMember.voice.disconnect();
+    return "disconnected";
+  },
+  async queue_open(params, ctx){
+    if(ctx.targetUser.bot) return "skipped (bot)";
+    if(!dmRelayGuildId) return "no DM hub configured";
+    const channel = await ensureTheCountChannel(ctx.targetUser).catch(()=>null);
+    return channel ? "opened" : "failed";
+  },
   async dm_user(params, ctx){
     const ok = await ctx.targetUser.send({ content:(params.message||"").slice(0,1500) }).then(()=>true).catch(()=>false);
     return ok ? "sent" : "failed (DMs closed)";
+  },
+  async fakequote(params, ctx){
+    try{
+      const displayName = ctx.targetUser.username;
+      const avatarURL = ctx.targetUser.displayAvatarURL({ size:512, dynamic:false, extension:"png" });
+      const avatarRes = await fetch(avatarURL);
+      if(!avatarRes.ok) return "avatar fetch failed";
+      const avatarBuffer = Buffer.from(await avatarRes.arrayBuffer());
+      const cardBuffer = await buildFakeQuoteCard({ avatarBuffer, quoteText: params.text||"", displayName, username: displayName });
+      await ctx.channel.send({ files:[{ attachment: cardBuffer, name:"quote_6660.png" }] }).catch(()=>{});
+      return "done";
+    }catch(e){ return `error: ${e.message}`; }
   },
   async pin_message(params, ctx){
     await ctx.targetMsg.pin();
@@ -962,10 +1102,162 @@ const JARVISENHANCE_RUNNERS = {
     await ctx.targetMsg.react((params.emoji||"").trim());
     return "reacted";
   },
-  async voice_disconnect(params, ctx){
-    if(!ctx.targetMember || !ctx.targetMember.voice?.channel) return "not in voice";
-    await ctx.targetMember.voice.disconnect();
-    return "disconnected";
+  async jarvis_image(params, ctx){
+    const imgs = await getJarvisImages();
+    if(!imgs.length) return "no images";
+    const pick = imgs[Math.floor(Math.random()*imgs.length)];
+    await ctx.targetMsg.reply({ files:[pick.download_url], allowedMentions:{repliedUser:false} }).catch(()=>{});
+    return pick.word;
+  },
+  async reaction_bomb(params, ctx){
+    const BOMB_EMOJIS = ["✅","👍","🔥","💀","😂","❤️","👑","💯","🎉","⚡","🏆","😈","🤣","💪","🌟"];
+    for(const emoji of BOMB_EMOJIS){ await ctx.targetMsg.react(emoji).catch(()=>{}); }
+    return "done";
+  },
+  async expose(params, ctx){
+    const content = ctx.targetMsg.content || "(no text)";
+    const exposePrefixes = ["🚨 CAUGHT IN 4K:","📢 ATTENTION EVERYONE:","🔍 EXPOSE THREAD:","📸 SCREENSHOT THIS:","⚠️ EVIDENCE:"];
+    const prefix = exposePrefixes[Math.floor(Math.random()*exposePrefixes.length)];
+    await ctx.channel.send({ content:`${prefix}\n> ${content}\n— <@${ctx.targetUser.id}>` }).catch(()=>{});
+    return "done";
+  },
+  async forcemarry(params, ctx){
+    const idMatch = (params.user2||"").match(/\d{15,20}/);
+    if(!idMatch) return "no valid user2";
+    const u2 = await client.users.fetch(idMatch[0]).catch(()=>null);
+    if(!u2) return "user2 not found";
+    if(u2.id === ctx.targetUser.id) return "skipped (same user)";
+    const s1 = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    const s2 = getScore(u2.id, u2.username);
+    if(s1.marriedTo || s2.marriedTo) return "already married";
+    s1.marriedTo=u2.id; s1.pendingProposal=null; s1.forceMarried=true;
+    s2.marriedTo=ctx.targetUser.id; s2.pendingProposal=null; s2.forceMarried=true;
+    saveData();
+    return "done";
+  },
+  async forcedivorce(params, ctx){
+    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    if(!s.marriedTo) return "not married";
+    const partner = scores.get(s.marriedTo);
+    if(partner){ partner.marriedTo=null; partner.pendingProposal=null; partner.forceMarried=false; }
+    s.marriedTo=null; s.pendingProposal=null; s.forceMarried=false;
+    saveData();
+    return "done";
+  },
+  async echo(params, ctx){
+    const payload = { content:(params.message||"").slice(0,2000), allowedMentions:{parse:[]} };
+    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
+    else await ctx.channel.send(payload).catch(()=>{});
+    return "done";
+  },
+  async send_embed(params, ctx){
+    let color = 0x5865F2;
+    const embed = { title: params.title||undefined, description: (params.message||"").slice(0,4000)||undefined, color };
+    if(!embed.title) delete embed.title;
+    if(!embed.description) delete embed.description;
+    if(!embed.title && !embed.description) return "nothing to send";
+    const payload = { embeds:[embed] };
+    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
+    else await ctx.channel.send(payload).catch(()=>{});
+    return "done";
+  },
+  async theremnant(params, ctx){
+    const payload = { embeds:[{ title:"👁️ The Remnant", description:(params.message||"").slice(0,1000), color:0x8E44AD, footer:{text:"A signal from somewhere else…"}, timestamp:new Date().toISOString() }] };
+    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
+    else await ctx.channel.send(payload).catch(()=>{});
+    return "done";
+  },
+  async purge(params, ctx){
+    if(!ctx.channel.permissionsFor?.(ctx.guild.members.me)?.has("MANAGE_MESSAGES")) return "missing Manage Messages";
+    const amount = Math.max(1, Math.min(100, parseInt(params.amount,10)||0));
+    if(!amount) return "invalid amount";
+    const messages = await ctx.channel.messages.fetch({ limit:amount });
+    const cutoff = Date.now() - (14*24*60*60*1000);
+    const fresh = [...messages.values()].filter(m => m.createdTimestamp > cutoff);
+    if(!fresh.length) return "nothing to delete";
+    const bulk = await ctx.channel.bulkDelete(fresh, true);
+    return `deleted ${bulk.size}`;
+  },
+  async setstatus(params, ctx){
+    const text = (params.text||"").slice(0,100);
+    if(!text) return "no text";
+    client.user.setActivity(text, { type:"PLAYING" });
+    botStatus = { text, type:"PLAYING" };
+    saveData();
+    return `set to "${text}"`;
+  },
+  async set_reminder(params, ctx){
+    const minutes = Math.max(1, Math.min(10080, parseInt(params.minutes,10)||0));
+    if(!minutes) return "invalid time";
+    reminders.push({ userId: ctx.actorId, channelId: ctx.channel.id, time: Date.now()+minutes*60000, message: (params.message||"").slice(0,500) });
+    return `set for ${minutes}m`;
+  },
+  async random_quote(params, ctx){
+    const chosen = await nextQuoteImage();
+    if(!chosen) return "no quotes available";
+    const sent = await ctx.channel.send({ files:[chosen.download_url] }).catch(()=>null);
+    if(sent){
+      quoteVoteMessages.set(sent.id, chosen.name);
+      const trashEntry = { filename: chosen.name, voters: new Set(), guildId: ctx.guild?.id||null, channelId: ctx.channel.id, sentToDeleter:false, type:"quote" };
+      trashcanVotes.set(sent.id, trashEntry);
+      const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
+      await sent.edit({ components: voteButtons }).catch(()=>{});
+      saveData();
+    }
+    return sent ? "sent" : "failed";
+  },
+  async random_good_quote(params, ctx){
+    const chosen = await nextGoodQuoteImage();
+    if(!chosen) return "no quotes available";
+    const sent = await ctx.channel.send({ files:[chosen.download_url] }).catch(()=>null);
+    if(sent){
+      quoteVoteMessages.set(sent.id, chosen.name);
+      const trashEntry = { filename: chosen.name, voters: new Set(), guildId: ctx.guild?.id||null, channelId: ctx.channel.id, sentToDeleter:false, type:"good" };
+      trashcanVotes.set(sent.id, trashEntry);
+      const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
+      await sent.edit({ components: voteButtons }).catch(()=>{});
+      saveData();
+    }
+    return sent ? "sent" : "failed";
+  },
+  async random_bad_quote(params, ctx){
+    const chosen = await nextBadQuoteImage();
+    if(!chosen) return "no quotes available";
+    const sent = await ctx.channel.send({ files:[chosen.download_url] }).catch(()=>null);
+    if(sent){
+      quoteVoteMessages.set(sent.id, chosen.name);
+      const trashEntry = { filename: chosen.name, voters: new Set(), guildId: ctx.guild?.id||null, channelId: ctx.channel.id, sentToDeleter:false, type:"bad" };
+      trashcanVotes.set(sent.id, trashEntry);
+      const voteButtons = makeQuoteVoteButtons(sent.id, quoteVotes.get(chosen.name), trashEntry);
+      await sent.edit({ components: voteButtons }).catch(()=>{});
+      saveData();
+    }
+    return sent ? "sent" : "failed";
+  },
+  async show_avatar(params, ctx){
+    const url = ctx.targetUser.displayAvatarURL({ size:1024, dynamic:true });
+    await ctx.channel.send({ embeds:[{ title:`${ctx.targetUser.username}'s avatar`, image:{url}, color:0x5865F2 }] }).catch(()=>{});
+    return "posted";
+  },
+  async give_xp(params, ctx){
+    const amt = parseInt(params.amount,10);
+    if(!Number.isFinite(amt)) return "invalid amount";
+    const s = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    s.xp = Math.max(0, (s.xp||0)+amt);
+    xpInfo(s);
+    saveData();
+    return `${amt>=0?"+":""}${amt} xp (now level ${s.level})`;
+  },
+  async propose_marriage(params, ctx){
+    if(!ctx.actorUser) return "no actor";
+    if(ctx.actorUser.id === ctx.targetUser.id) return "skipped (self)";
+    const s = getScore(ctx.actorUser.id, ctx.actorUser.username);
+    const t = getScore(ctx.targetUser.id, ctx.targetUser.username);
+    if(s.marriedTo) return "you're already married";
+    if(t.marriedTo) return "target already married";
+    t.pendingProposal = ctx.actorUser.id;
+    saveData();
+    return "proposed";
   },
 };
 
@@ -976,7 +1268,11 @@ async function runJarvisEnhanceProfile(profile, ctx){
     const runner = JARVISENHANCE_RUNNERS[step.type];
     if(!def || !runner){ results.push(`❓ ${step.type}: unknown action`); continue; }
     try{
-      const outcome = await runner(step.params||{}, ctx);
+      let params = step.params||{};
+      if(def.dynamicField && !(params[def.dynamicField]||"").trim() && ctx.restText){
+        params = { ...params, [def.dynamicField]: ctx.restText };
+      }
+      const outcome = await runner(params, ctx);
       results.push(`${def.emoji} ${def.label}: ${outcome}`);
     }catch(e){
       results.push(`${def.emoji} ${def.label}: ❌ ${e.message}`);
@@ -1205,6 +1501,25 @@ const JARVIS_FOLDER = "jarvis";
 let jarvisImageCache = []; // [{ name, word, download_url }]
 let jarvisCacheFetchedAt = 0;
 const JARVIS_CACHE_TTL_MS = 2 * 60 * 1000; // refresh at most every 2 minutes
+
+// ── /jarvislist — paginated embed gallery of every image in the Jarvis folder ──
+function buildJarvisListPage(images, page, pageSize=5) {
+  const totalPages = Math.max(1, Math.ceil(images.length/pageSize));
+  const p = Math.max(0, Math.min(page, totalPages-1));
+  const slice = images.slice(p*pageSize, p*pageSize+pageSize);
+  const embeds = slice.map(img => ({
+    title: img.name,
+    description: `Trigger word: \`${img.word}\``,
+    image: { url: img.download_url },
+    color: 0x5865F2,
+  }));
+  const rows = [new MessageActionRow().addComponents(
+    new MessageButton().setCustomId(`jlist_prev_${p}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(p===0),
+    new MessageButton().setCustomId(`jlist_page_${p}`).setLabel(`Page ${p+1}/${totalPages}`).setStyle("PRIMARY").setDisabled(true),
+    new MessageButton().setCustomId(`jlist_next_${p}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(p>=totalPages-1),
+  )];
+  return { content:`🗂️ **Jarvis Image Folder** — ${images.length} image(s) total`, embeds, components:rows };
+}
 
 async function getJarvisImages() {
   const now = Date.now();
@@ -1697,6 +2012,7 @@ function buildDataObject() {
     memers:               [...MEMERS],
     quoteVotes:           [...quoteVotes.entries()],
     quoteVoteMessages:    [...quoteVoteMessages.entries()],
+    favoritedQuotes:      [...favoritedQuotes.entries()].map(([k,v]) => [k, [...v]]),
     reviewChannelId:      reviewChannelId,
     deleterChannelId:     deleterChannelId,
     trashcanThreshold:    trashcanThreshold,
@@ -1953,6 +2269,7 @@ function loadData() {
       });
     }
     if (data.quoteVoteMessages)  data.quoteVoteMessages.forEach(([k,v]) => quoteVoteMessages.set(k, v));
+    if (data.favoritedQuotes)    data.favoritedQuotes.forEach(([k,v]) => favoritedQuotes.set(k, new Set(v)));
 
     if (typeof data.dmRelayGuildId === "string") dmRelayGuildId = data.dmRelayGuildId;
     if (data.dmRelayChannels) {
@@ -2867,6 +3184,33 @@ function chunkArray(arr, size) {
 
 function getEligibleTicketRoles(guild) {
   return [...guild.roles.cache.filter(r => !r.managed && r.id !== guild.id).values()];
+}
+
+// Shared by every ticket action — the ticket_open/close/reopen/delete/claim
+// buttons and the /closeticket, /addtoticket, /removefromticket commands all
+// used to repeat this exact check inline. Same logic, same precedence as
+// before: owner, any configured support role, or Manage Channels.
+function isTicketStaff(cfg, member) {
+  if (!member) return false;
+  if (OWNER_IDS.includes(member.id)) return true;
+  const roleIds = (cfg?.supportRoleIds || [cfg?.supportRoleId]).filter(Boolean);
+  if (roleIds.some(rid => member.roles.cache.has(rid))) return true;
+  return member.permissions.has("MANAGE_CHANNELS");
+}
+
+// The two button rows a ticket channel cycles between: open/reopened
+// tickets show Close+Claim, closed tickets show Reopen+Delete.
+function buildTicketActiveRow() {
+  return new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"),
+    new MessageButton().setCustomId("ticket_claim").setLabel("Claim 🙋").setStyle("SUCCESS"),
+  );
+}
+function buildTicketStaffRow() {
+  return new MessageActionRow().addComponents(
+    new MessageButton().setCustomId("ticket_reopen").setLabel("Reopen 🔓").setStyle("SUCCESS"),
+    new MessageButton().setCustomId("ticket_delete").setLabel("Delete Ticket 🗑️").setStyle("DANGER"),
+  );
 }
 
 // items: [{label, value, emoji}]. mode "single" = pick one (spread across
@@ -4078,6 +4422,8 @@ function buildCommands(){
       ]},
       {name:"name",description:"Profile ID (required for create/edit/delete)",type:3,required:false},
     ]},
+    {name:"jarvislist", description:"Show every image in the Jarvis folder — filename + preview, paginated"},
+    {name:"favoritelibrary", description:"[Patreon] Browse your favorited quotes"},
     {name:"download", description:"Download a YouTube video as MP4 or MP3",options:[
       {name:"url",        description:"YouTube video URL",type:3,required:true},
       {name:"format",     description:"File format (default: MP4)",type:3,required:false,choices:[
@@ -4230,6 +4576,18 @@ client.once("ready", async () => {
     catch(e) { console.error("Failed to restore persistent status:", e.message); }
   }
 
+  // Warm the quote-folder cache immediately on startup. quoteFileFolderCache
+  // (which folder — quotes vs quotes2 — a given filename lives in) is
+  // rebuilt from GitHub's actual listing rather than persisted, since that's
+  // always authoritative; but it starts empty after every restart, and
+  // /library builds its image URL from just a filename via quoteRawUrl(),
+  // which silently falls back to "quotes" when a name isn't cached yet. That
+  // fallback is wrong for anything uploaded via /upload or an approved
+  // /requestupload, since those always live in quotes2 — so without this
+  // warm-up, /library links break for quotes2 images until something else
+  // (like /quote) happens to populate the cache first.
+  fetchAllQuoteFiles().catch(e => console.error("Quote folder warm-up failed:", e.message));
+
   // Fetch app-level emojis (uploaded via Developer Portal) and cache them
   try {
     const emojiRes = await fetch(`https://discord.com/api/v10/applications/${CLIENT_ID}/emojis`, {
@@ -4379,6 +4737,24 @@ function makeQuoteVoteButtons(msgId, votes, trashData) {
         .setLabel(newBtn.label)
         .setStyle("PRIMARY")
         .setEmoji({ name: newBtn.emoji }),
+      new MessageButton()
+        .setCustomId(`qfav_${msgId}`)
+        .setLabel("Favorite")
+        .setStyle("SECONDARY")
+        .setEmoji({ name: "⭐" }),
+    ),
+  ];
+}
+
+// Nav buttons for /favoritelibrary — same idea as makeLibraryButtons, but
+// scoped to the clicking user's own favorites (no targetUserId needed) and
+// with a Remove Favorite button instead of Flag for Review.
+function buildFavoriteLibraryButtons(idx, total) {
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`flib_prev_${idx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(idx===0),
+      new MessageButton().setCustomId(`flib_next_${idx}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(total<=1||idx>=total-1),
+      new MessageButton().setCustomId(`flib_unfav_${idx}`).setLabel("Remove Favorite").setStyle("DANGER").setEmoji({ name:"⭐" }),
     ),
   ];
 }
@@ -4386,7 +4762,13 @@ function makeQuoteVoteButtons(msgId, votes, trashData) {
 // ── Library embed & components ────────────────────────────────────────────────
 // Renders a user's uploaded-quotes library as an embed (image + prev/next/goto
 // paging), with a 🗑️ button to flag the currently-viewed image for owner review.
-function buildLibraryEmbed(displayName, avatarUrl, fileName, idx, total) {
+// Resolves the raw.githubusercontent.com URL for a library image, verifying
+// the folder (quotes vs quotes2) via the GitHub API when it isn't already
+// cached rather than guessing — quoteRawUrl()'s bare "quotes" fallback is
+// wrong for anything from /upload or an approved /requestupload, since those
+// always land in quotes2.
+async function buildLibraryEmbed(displayName, avatarUrl, fileName, idx, total) {
+  if (!quoteFileFolderCache.has(fileName)) await resolveQuoteGhPath(fileName).catch(()=>{});
   return {
     embeds: [{
       author: { name: `${displayName}'s Library`, icon_url: avatarUrl || undefined },
@@ -5324,33 +5706,62 @@ client.on("messageCreate",async msg=>{
   }
 
   // ── Jarvis Enhance: owner-built automation chains, triggered by word ────────
-  // Same shape as the image trigger above — reply + wake word — but matched
-  // against saved profiles' trigger word(s) using identical whole-word
-  // tokenized matching. Each profile can be owner-locked (only the owner, or
-  // someone granted /jarvisenhance via /tempowner, can fire it) or unlocked
-  // (anyone can say the word).
-  if(msg.reference && jarvisEnhanceProfiles.size){
-    const jeWakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b/i);
+  // Trigger words match whole-word (or, for multi-word phrases like "hit a
+  // clip", a substring check) against the message — same style as the Jarvis
+  // image trigger. A reply is only required when the profile actually has an
+  // action that needs the reply target; broadcast-only profiles (like the
+  // built-in "hit a clip" → random quote) fire on a plain "Jarvis, hit a
+  // clip" with no reply needed. Each profile can be owner-locked (only the
+  // owner, or someone granted /jarvisenhance via /tempowner, can fire it) or
+  // unlocked (anyone can say the word). Runs fully silently — no "ran X"
+  // confirmation is posted either way; only console.error on unexpected
+  // failures.
+  if(jarvisEnhanceProfiles.size){
+    const jeWakeMatch = msg.content.trim().match(/^(royalbot|jarvis)\b[,:\-\s]*/i);
     if(jeWakeMatch){
       try {
-        const jeWords = (msg.content.toLowerCase().match(/[a-z0-9]+/g)) || [];
+        const jeContentLower = msg.content.toLowerCase();
+        const jeWords = jeContentLower.match(/[a-z0-9]+/g) || [];
         const jeWordSet = new Set(jeWords);
-        const profile = [...jarvisEnhanceProfiles.values()].find(p =>
-          p.triggers.some(t => jeWordSet.has(t.toLowerCase()))
-        );
+        let matchedTrigger = null;
+        const profile = [...jarvisEnhanceProfiles.values()].find(p => {
+          const hit = p.triggers.find(t => {
+            const tl = t.toLowerCase();
+            return tl.includes(" ") ? jeContentLower.includes(tl) : jeWordSet.has(tl);
+          });
+          if(hit){ matchedTrigger = hit; return true; }
+          return false;
+        });
         if(profile){
           const locked = profile.ownerLocked !== false;
           const allowed = locked ? isEffectiveOwner(msg.author.id, "jarvisenhance") : !msg.author.bot;
           if(allowed){
-            const targetMsg = await msg.fetchReference().catch(() => null);
-            if(targetMsg){
-              const targetMember = msg.guild ? await msg.guild.members.fetch(targetMsg.author.id).catch(() => null) : null;
-              const ctx = { targetMsg, targetUser: targetMsg.author, targetMember, channel: msg.channel, guild: msg.guild };
-              const results = await runJarvisEnhanceProfile(profile, ctx);
-              await msg.reply({ content:`🤖 **Jarvis Enhance** ran:\n${results.join("\n")}`, allowedMentions:{ repliedUser:false } }).catch(()=>{});
+            const needsTarget = profile.actions.some(step => {
+              const def = JARVISENHANCE_ACTIONS.find(a=>a.id===step.type);
+              if(!def) return false;
+              if(def.needs!=="channel" && def.needs!=="none") return true;
+              return step.params?.replyMode === "reply";
+            });
+            let targetMsg=null, targetMember=null;
+            if(msg.reference){
+              targetMsg = await msg.fetchReference().catch(() => null);
+              if(targetMsg && msg.guild) targetMember = await msg.guild.members.fetch(targetMsg.author.id).catch(() => null);
             }
-          } else if(locked){
-            await msg.reply({ content:"🔒 That Jarvis Enhance trigger is owner locked.", allowedMentions:{ repliedUser:false } }).catch(()=>{});
+            if(!needsTarget || targetMsg){
+              // Whatever's left after the wake word and the matched trigger
+              // word is the live custom text — e.g. "Jarvis, dm knock it off"
+              // → restText = "knock it off", available to any action's
+              // dynamicField left blank in the builder.
+              const afterWake = msg.content.slice(jeWakeMatch[0].length);
+              const triggerRe = new RegExp(`\\b${matchedTrigger.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`, "i");
+              const restText = afterWake.replace(triggerRe, "").trim();
+              const ctx = {
+                targetMsg, targetUser: targetMsg ? targetMsg.author : null, targetMember,
+                channel: msg.channel, guild: msg.guild, restText,
+                actorId: msg.author.id, actorUser: msg.author,
+              };
+              await runJarvisEnhanceProfile(profile, ctx);
+            }
           }
         }
       } catch(e) { console.error("Jarvis Enhance trigger error:", e.message); }
@@ -5852,6 +6263,57 @@ client.on("interactionCreate",async interaction=>{
       return;
     }
 
+    // ── Favorite a quote (⭐ button, Patreon-exclusive) ──────────────────────────
+    if(cid.startsWith("qfav_")){
+      const msgId = cid.slice("qfav_".length);
+      const filename = quoteVoteMessages.get(msgId);
+      if(!filename){ try{await interaction.reply({content:"❌ Couldn't find this quote.",ephemeral:true});}catch{} return; }
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      let set = favoritedQuotes.get(uid);
+      if(!set){ set = new Set(); favoritedQuotes.set(uid, set); }
+      let added;
+      if(set.has(filename)){ set.delete(filename); added=false; } else { set.add(filename); added=true; }
+      saveData();
+      try{await interaction.reply({content: added ? `⭐ Added \`${filename}\` to your favorites.` : `☆ Removed \`${filename}\` from your favorites.`, ephemeral:true});}catch{}
+      return;
+    }
+
+    // ── /favoritelibrary pagination (Patreon-exclusive) ──────────────────────────
+    if(cid.startsWith("flib_prev_")||cid.startsWith("flib_next_")||cid.startsWith("flib_unfav_")){
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      const favSet = favoritedQuotes.get(uid);
+      let files = favSet ? [...favSet] : [];
+      if(!files.length){ try{await interaction.update({content:"⭐ You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
+      let idx = parseInt(cid.slice(cid.lastIndexOf("_")+1),10)||0;
+      if(cid.startsWith("flib_unfav_")){
+        const removedName = files[idx];
+        favSet.delete(removedName);
+        saveData();
+        files = [...favSet];
+        if(!files.length){ try{await interaction.update({content:"⭐ Removed. You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
+      } else if(cid.startsWith("flib_next_")){
+        idx = idx+1;
+      } else {
+        idx = idx-1;
+      }
+      idx = Math.max(0, Math.min(idx, files.length-1));
+      const fn = files[idx];
+      const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
+      try{
+        await interaction.update({
+          ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, fn, idx, files.length)),
+          components: buildFavoriteLibraryButtons(idx, files.length),
+        });
+      }catch{}
+      return;
+    }
+
     // ── Quote vote buttons ─────────────────────────────────────────────────────
     // qvote_up_{msgId}, qvote_down_{msgId}, qvote_trash_{msgId}, qvote_who_{msgId}, qvote_uploader_{msgId}
     if(cid.startsWith("qvote_up_") || cid.startsWith("qvote_down_") || cid.startsWith("qvote_trash_") || cid.startsWith("qvote_who_") || cid.startsWith("qvote_uploader_")){
@@ -5946,7 +6408,7 @@ client.on("interactionCreate",async interaction=>{
                     `🗑️ **Quote Flagged for Review**`,
                     `📎 Filename: \`${tv.filename}\``,
                     `🔗 [Jump to message](${msgLink})`,
-                    `👥 Flagged by **${tv.voters.size}** user(s) (threshold: ${trashcanThreshold})`,
+                    `👥 Flagged by: ${[...tv.voters].map(id=>`<@${id}>`).join(", ")} (${tv.voters.size}/${trashcanThreshold})`,
                     `🖼️ ${imageUrl}`,
                   ].join("\n"),
                   components:[row],
@@ -6372,7 +6834,7 @@ client.on("interactionCreate",async interaction=>{
           const fileName = files[gotoIdx];
           try{
             await interaction.message.edit({
-              ...buildLibraryEmbed(displayName, avatarUrl, fileName, gotoIdx, files.length),
+              ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, gotoIdx, files.length)),
               components: makeLibraryButtons(targetUserId, gotoIdx, files.length, false),
             });
           }catch{}
@@ -6387,7 +6849,7 @@ client.on("interactionCreate",async interaction=>{
       const fileName = files[newIdx];
       try{
         await interaction.update({
-          ...buildLibraryEmbed(displayName, avatarUrl, fileName, newIdx, files.length),
+          ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, newIdx, files.length)),
           components: makeLibraryButtons(targetUserId, newIdx, files.length, false),
         });
       }catch{}
@@ -6437,7 +6899,7 @@ client.on("interactionCreate",async interaction=>{
         const displayName = targetUser?.username || "Unknown";
         const avatarUrl = targetUser?.displayAvatarURL({ size:128, dynamic:true });
         await interaction.editReply({
-          ...buildLibraryEmbed(displayName, avatarUrl, fileName, idx, files.length),
+          ...(await buildLibraryEmbed(displayName, avatarUrl, fileName, idx, files.length)),
           components: makeLibraryButtons(targetUserId, idx, files.length, true),
         });
       }catch{}
@@ -6709,7 +7171,7 @@ client.on("interactionCreate",async interaction=>{
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
         {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word: say it while replying to run a chain of any bot action or Discord mod action (kick, ban, timeout, roles, nickname, DM, pin, delete, react, voice) in order","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word (categorized: Clankerify, Moderation, Messaging, Broadcast): say it while replying to run a chain of actions in order, mode/duration picked with no typing, and blank text fields auto-fill from whatever you say after the trigger word","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const p=HELP_PAGES[page];
       const navRow=new MessageActionRow().addComponents(
@@ -6904,10 +7366,7 @@ client.on("interactionCreate",async interaction=>{
           topic:`Ticket #${ticketId} | Opened by ${member.user.tag}`
         });
         openTickets.set(channel.id,{guildId,userId:uid,ticketId,channelId:channel.id,subject:"",openedAt:Date.now(),status:"open"});saveData();
-        const activeRow=new MessageActionRow().addComponents(
-          new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"),
-          new MessageButton().setCustomId("ticket_claim").setLabel("Claim 🙋").setStyle("SUCCESS"),
-        );
+        const activeRow=buildTicketActiveRow();
         await channel.send({content:`🎫 **Ticket #${ticketId}** — <@${uid}>\n\nHello <@${uid}>! Support will be with you shortly.${(cfg2.supportRoleIds||[]).map(r=>`<@&${r}>`).join(" ")?`\n${(cfg2.supportRoleIds||[]).map(r=>`<@&${r}>`).join(" ")}`:""}`,components:[activeRow]});
         if(cfg2.logChannelId){const logCh=guild.channels.cache.get(cfg2.logChannelId);if(logCh)await safeSend(logCh,`📂 **Ticket #${ticketId} opened** by <@${uid}> — <#${channel.id}>`);}
         try{await interaction.followUp({content:`✅ Your ticket has been created: <#${channel.id}>`,ephemeral:true});}catch{}
@@ -6922,7 +7381,7 @@ client.on("interactionCreate",async interaction=>{
       if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
       const cfg=ticketConfigs.get(ticket.guildId);
       const member=interaction.member;
-      const isStaff=OWNER_IDS.includes(uid)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>member.roles.cache.has(rid))||member.permissions.has("MANAGE_CHANNELS");
+      const isStaff=isTicketStaff(cfg,member);
       const canClose=ticket.userId===uid||isStaff;
       if(!canClose){try{await interaction.followUp({content:"You don't have permission to close this ticket.",ephemeral:true});}catch{}return;}
       // Remove the ticket owner's access to the channel
@@ -6931,10 +7390,7 @@ client.on("interactionCreate",async interaction=>{
       ticket.closedBy=uid;
       ticket.closedAt=Date.now();
       saveData();
-      const staffRow=new MessageActionRow().addComponents(
-        new MessageButton().setCustomId("ticket_reopen").setLabel("Reopen 🔓").setStyle("SUCCESS"),
-        new MessageButton().setCustomId("ticket_delete").setLabel("Delete Ticket 🗑️").setStyle("DANGER"),
-      );
+      const staffRow=buildTicketStaffRow();
       try{
         await interaction.editReply({
           content:`🔒 **Ticket #${ticket.ticketId} closed** by <@${uid}>.\n\n*<@${ticket.userId}> no longer has access.*\n**Staff:** Use the buttons below to reopen or permanently delete this ticket.`,
@@ -6951,7 +7407,7 @@ client.on("interactionCreate",async interaction=>{
       if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
       const cfg=ticketConfigs.get(ticket.guildId);
       const member=interaction.member;
-      const isStaff=OWNER_IDS.includes(uid)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>member.roles.cache.has(rid))||member.permissions.has("MANAGE_CHANNELS");
+      const isStaff=isTicketStaff(cfg,member);
       if(!isStaff){try{await interaction.followUp({content:"Only support staff can reopen tickets.",ephemeral:true});}catch{}return;}
       // Restore the ticket owner's access
       try{await interaction.channel.permissionOverwrites.edit(ticket.userId,{VIEW_CHANNEL:true,SEND_MESSAGES:true,READ_MESSAGE_HISTORY:true});}catch{}
@@ -6959,10 +7415,7 @@ client.on("interactionCreate",async interaction=>{
       delete ticket.closedBy;
       delete ticket.closedAt;
       saveData();
-      const activeRow=new MessageActionRow().addComponents(
-        new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"),
-        new MessageButton().setCustomId("ticket_claim").setLabel("Claim 🙋").setStyle("SUCCESS"),
-      );
+      const activeRow=buildTicketActiveRow();
       try{
         await interaction.editReply({
           content:`🔓 **Ticket #${ticket.ticketId} reopened** by <@${uid}>.\n\n<@${ticket.userId}> has been given access again.`,
@@ -6979,7 +7432,7 @@ client.on("interactionCreate",async interaction=>{
       if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
       const cfg=ticketConfigs.get(ticket.guildId);
       const member=interaction.member;
-      const isStaff=OWNER_IDS.includes(uid)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>member.roles.cache.has(rid))||member.permissions.has("MANAGE_CHANNELS");
+      const isStaff=isTicketStaff(cfg,member);
       if(!isStaff){try{await interaction.followUp({content:"Only support staff can delete tickets.",ephemeral:true});}catch{}return;}
       openTickets.delete(interaction.channelId);saveData();
       try{
@@ -6998,9 +7451,10 @@ client.on("interactionCreate",async interaction=>{
       if(!ticket){try{await interaction.followUp({content:"This doesn't look like a ticket channel.",ephemeral:true});}catch{}return;}
       const cfg=ticketConfigs.get(ticket.guildId);
       const member=interaction.member;
-      const canClaim=OWNER_IDS.includes(uid)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>member.roles.cache.has(rid))||member.permissions.has("MANAGE_CHANNELS");
+      const canClaim=isTicketStaff(cfg,member);
       if(!canClaim){try{await interaction.followUp({content:"Only support staff can claim tickets.",ephemeral:true});}catch{}return;}
       ticket.claimedBy=uid;
+      saveData();
       try{
         await interaction.editReply({content:`🎫 **Ticket #${ticket.ticketId}** — <@${ticket.userId}>\n🙋 **Claimed by <@${uid}>**`,components:[new MessageActionRow().addComponents(new MessageButton().setCustomId("ticket_close").setLabel("Close Ticket 🔒").setStyle("DANGER"))]});
         await safeSend(interaction.channel,`✅ <@${uid}> has claimed this ticket and will be assisting you.`);
@@ -7102,8 +7556,28 @@ client.on("interactionCreate",async interaction=>{
     }
 
     // ── /jarvisenhance builder ───────────────────────────────────────────────────
-    // Add-action select: opens a param modal (unless the action needs none, in
-    // which case it's appended immediately).
+    // Category select: choose which group of actions to browse.
+    if(cid.startsWith("je_category_")){
+      const token = cid.slice("je_category_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid){ try{await interaction.reply({content:"❌ This panel expired — run `/jarvisenhance` again.",ephemeral:true});}catch{} return; }
+      b.category = interaction.values[0];
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    if(cid.startsWith("je_addback_")){
+      const token = cid.slice("je_addback_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      b.category = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+
+    // Add-action select (within a category): Clankerify/Impersonation skip the
+    // modal entirely and go through point-and-click mode+duration pickers
+    // instead — no typing a mode name. Zero-field actions are appended
+    // immediately. Everything else opens a param modal as before.
     if(cid.startsWith("je_addtype_")){
       const token = cid.slice("je_addtype_".length);
       const b = jarvisEnhanceBuilders.get(token);
@@ -7111,6 +7585,12 @@ client.on("interactionCreate",async interaction=>{
       const actionType = interaction.values[0];
       const def = JARVISENHANCE_ACTIONS.find(a=>a.id===actionType);
       if(!def) return;
+      if(actionType==="clankerify" || actionType==="impersonation"){
+        b.pendingActionType = actionType;
+        b.pendingMode = null;
+        try{ await interaction.update(buildJarvisModePicker(token)); }catch{}
+        return;
+      }
       if(!def.fields.length){
         b.actions.push({ type:actionType, params:{} });
         b.selectedStep = b.actions.length-1;
@@ -7123,6 +7603,54 @@ client.on("interactionCreate",async interaction=>{
         custom_id:`je_modal_params_${token}`,
         components: def.fields.map(f => ({type:1,components:[{type:4,custom_id:f.key,label:f.label.slice(0,45),style:f.style,required:!!f.required,max_length:f.max||100}]})),
       }).catch(e=>console.error("[je_addtype modal]",e.message));
+      return;
+    }
+
+    // Clankerify/Impersonation: mode picked, now show the duration picker.
+    if(cid.startsWith("je_pickmode_")){
+      const token = cid.slice("je_pickmode_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      b.pendingMode = interaction.values[0];
+      try{ await interaction.update(buildJarvisDurationPicker(token)); }catch{}
+      return;
+    }
+    // Clankerify/Impersonation: duration picked — action is complete, push it.
+    if(cid.startsWith("je_pickduration_")){
+      const token = cid.slice("je_pickduration_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      const raw = interaction.values[0];
+      const duration = raw==="permanent" ? "" : (raw==="disable" ? "0" : raw);
+      b.actions.push({ type:b.pendingActionType, params:{ mode:b.pendingMode, duration } });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      b.pendingMode = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    // Echo/Send Embed/The Remnant: reply-mode picked — action is complete, push it.
+    if(cid.startsWith("je_pickreply_")){
+      const token = cid.slice("je_pickreply_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid || !b.pendingActionType) return;
+      const params = { ...(b.pendingParams||{}), replyMode: interaction.values[0] };
+      b.actions.push({ type:b.pendingActionType, params });
+      b.selectedStep = b.actions.length-1;
+      b.pendingActionType = null;
+      b.pendingParams = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
+      return;
+    }
+    // Cancel out of the mode/duration/reply-mode picker sub-flow back to the main panel.
+    if(cid.startsWith("je_addcancel_")){
+      const token = cid.slice("je_addcancel_".length);
+      const b = jarvisEnhanceBuilders.get(token);
+      if(!b || b.ownerId!==uid) return;
+      b.pendingActionType = null;
+      b.pendingMode = null;
+      b.pendingParams = null;
+      try{ await interaction.update(buildJarvisEnhancePanel(token)); }catch{}
       return;
     }
 
@@ -7222,6 +7750,15 @@ client.on("interactionCreate",async interaction=>{
     }
     if(cid === "je_delcancel"){
       try{await interaction.update({content:"Cancelled.", components:[]});}catch{}
+      return;
+    }
+
+    // ── /jarvislist pagination ───────────────────────────────────────────────────
+    if(cid.startsWith("jlist_prev_")||cid.startsWith("jlist_next_")){
+      const isNext = cid.startsWith("jlist_next_");
+      const curPage = parseInt(cid.slice(isNext?"jlist_next_".length:"jlist_prev_".length),10)||0;
+      const images = await getJarvisImages();
+      try{ await interaction.update(buildJarvisListPage(images, isNext?curPage+1:curPage-1)); }catch{}
       return;
     }
 
@@ -7537,6 +8074,12 @@ client.on("interactionCreate",async interaction=>{
       const params = {};
       for(const f of (def?.fields||[])){
         params[f.key] = (interaction.fields.getTextInputValue(f.key)||"").trim();
+      }
+      if(def?.replyable){
+        // Echo/Send Embed/The Remnant get one more pick-from-a-list step
+        // (Reply vs Send normally) before the action is actually pushed.
+        b.pendingParams = params;
+        return safeReply(interaction,{...buildJarvisReplyModePicker(token), ephemeral:true});
       }
       b.actions.push({ type:b.pendingActionType, params });
       b.selectedStep = b.actions.length-1;
@@ -8195,12 +8738,37 @@ if(cmd==="jarvisenhance"){
     triggers: existing ? [...existing.triggers] : [],
     actions: existing ? existing.actions.map(a => ({ type:a.type, params:{...a.params} })) : [],
     ownerLocked: existing ? existing.ownerLocked !== false : true,
+    category: null,
     selectedStep: null,
     pendingActionType: null,
+    pendingMode: null,
+    pendingParams: null,
   });
   setTimeout(()=>jarvisEnhanceBuilders.delete(token), 15*60*1000);
 
   return safeReply(interaction,{...buildJarvisEnhancePanel(token), ephemeral:true});
+}
+
+if(cmd==="jarvislist"){
+  await interaction.deferReply({ephemeral:true}).catch(()=>{});
+  const images = await getJarvisImages();
+  if(!images.length) return safeReply(interaction,"No images found in the Jarvis folder.");
+  return safeReply(interaction, buildJarvisListPage(images, 0));
+}
+
+if(cmd==="favoritelibrary"){
+  if(!(await isPatreonMember(interaction.user.id)))
+    return safeReply(interaction,{content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});
+  const favSet = favoritedQuotes.get(interaction.user.id);
+  const files = favSet ? [...favSet] : [];
+  if(!files.length)
+    return safeReply(interaction,{content:"⭐ You haven't favorited any quotes yet — click the ⭐ Favorite button on a quote to add one.",ephemeral:true});
+  const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
+  return safeReply(interaction,{
+    ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, files[0], 0, files.length)),
+    components: buildFavoriteLibraryButtons(0, files.length),
+    ephemeral:true,
+  });
 }
 
 if(cmd==="theremnant"){
@@ -8695,7 +9263,7 @@ if(cmd==="divorce"){
         {title:"📺 YouTube Tracking  —  Page 5 / 8",description:["Track a YouTube channel's subscriber count live in Discord.","All commands require **Manage Server** permission.","","**Setup (do this first)**","`/ytsetup channel:… discord_channel:… [apikey:…]` — Connect a YouTube channel","> Accepts `@handle`, full URL, or channel ID starting with UC","> Provide your YouTube Data API v3 key on first use — it's saved to botdata","> Get a free key at console.cloud.google.com → enable YouTube Data API v3","","**Live Sub Count**","`/subcount threshold:1K|10K` — Post an embed that edits itself every 5 min","","**Sub Goal**","`/subgoal goal:N [message]` — Live progress bar towards a target sub count","> Fires a custom or default message when the goal is reached","","**Milestones**","`/milestones action:add subs:N [message]` — Announce when a sub count is crossed","`/milestones action:remove subs:N` — Remove a milestone","`/milestones action:list` — View all milestones and their status"].join("\n")},
         {title:"🤖 Community Modes  —  Page 6 / 8",description:["Clankerify replaces a user's messages with a webhook impersonating them in a chosen personality.","","**For Everyone**","`/selfclank duration:1-5` — Clankerify yourself for 1–5 min with any mode","> Choose from built-in modes or any custom modes players have built","> Max 2 self-clanked users per server at once","> `/selfclank duration:0` to cancel early","","**Built-in Modes**","🤖 No mode (plain) · 😈 Evil · 😏 Freaky · 🦅 American · 🫖 British","🪖 Stupid · 📰 Boomer · 🔺 Conspiracy · 🗺️ NPC · 😤 Sigma","⚔️ Medieval · 👻 Ghost · 🏴‍☠️ Pirate · 🦝 RespawnRaccoon Propaganda","🇫🇷 French · 🐱 UWU/LOLCAT · 🎲 Random","","**Custom Modes** — anyone can build one with `/clankerbuild`","`/clankerbuild action:create name:<id>` — Opens a builder modal with:","  • Display name format (`{name}` = the user's name)","  • Word replacements (`Test>Test2; friend>pardner, …`)","  • Signoffs (`yeehaw!;much obliged;git along now`)","  • Message start prefix","  • Emoji shown in the mode selector","`/clankerbuild action:list` — View all custom modes","`/clankerbuild action:delete name:<id>` — Remove a custom mode","","Custom modes appear automatically in the `/clankerify` and `/selfclank` dropdowns."].join("\n")},
         {title:"🖼️ Media & Quotes  —  Page 7 / 8",description:["**Quotes Folder**","`/upload source|link:…` — Upload an image/audio/video *(authorized users)*","`/requestupload source:…` — Submit a file to be reviewed for the quotes folder","`/managememers action:add|remove|list [user]` — [Owner] Manage the upload allowlist","`/quotemanage …` — [Owner] Browse, delete, and configure the quotes folder","`/dailyquote action:set|disable|status [channel] [hour]` — Auto-post a daily quote (Manage Server)","`/library user:… [page]` — Browse a user's uploaded quotes","","**Other Media Tools**","`/pixeltxt action:structure|destructure file:…` — Convert an image to/from a compressed text format","`/jarvisdatabase source:… name:…` — Upload a trigger image/gif/video straight to the Jarvis folder","`/download url:… [format] [resolution]` — Download a YouTube video as MP4 or MP3"].join("\n")},
-        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word: say it while replying to run a chain of any bot action or Discord mod action (kick, ban, timeout, roles, nickname, DM, pin, delete, react, voice) in order","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
+        {title:"🔒 Owner Tools  —  Page 8 / 8",description:["**Bot Management**","`/servers` — List servers & invite links","`/botstats` — Bot stats","`/setstatus text:… [type]` — Set bot presence","`/restart` — Restart the bot","`/refreshcmds` — Force re-register slash commands in this guild","`/adminconfig [key] [value]` — View/edit global config values","","**User & Server Actions**","`/forcemarry user1:… user2:…` — Force marry two users","`/forcedivorce user:…` — Force divorce a user","`/leaveserver server:…` — Leave a server","`/blacklist [user]` — Interactive picker: block a user from specific commands, or Full Blacklist","`/shadowdelete user:… percentage:…` — Randomly delete a % of a user's messages","`/clankerify user:… [duration]` — Resend a user's messages as a webhook impersonating them","`/impersonation user:… [as_user] [pfp] [name] [mode] [duration]` — Like clankerify, but resend as someone/something else","`/thecount user:…` — Open a queue channel for a user; messages sent there wait until /send","`/send` — Deliver everything queued in every /thecount channel to their respective users","`/paranoia user:… [chance]` — DM a user creepy paranoia messages","`/fakemessage user:… [message] [file] [mode]` — Send a message as another user via webhook","`/fakequote user:… text:… [displayname] [username]` — Generate a 'Make it a Quote' style card","`/theremnant message:…` — Send a mysterious dimensional transmission","`/jarvisenhance action:… name:…` — Build a custom Jarvis trigger word (categorized: Clankerify, Moderation, Messaging, Broadcast): say it while replying to run a chain of actions in order, mode/duration picked with no typing, and blank text fields auto-fill from whatever you say after the trigger word","","**Access & Relay**","`/tempowner user:… duration:… [commands]` — Grant a user temporary owner access","`/dmconfig [server] [user]` — Set up the DM relay hub or open a relay channel"].join("\n")},
       ];
       const TOTAL=HELP_PAGES.length;
       function buildHelpEmbed(page){
@@ -9364,6 +9932,9 @@ if(cmd==="divorce"){
     // Ticket setup command
     if(cmd==="ticketsetup"){
       if(!inGuild)return safeReply(interaction,{content:"Server only.",ephemeral:true});
+      const isOwnerTs=OWNER_IDS.includes(interaction.user.id);
+      const isAdminTs=interaction.member?.permissions.has("MANAGE_GUILD");
+      if(!isOwnerTs&&!isAdminTs)return safeReply(interaction,{content:"You need Manage Server permission to run this.",ephemeral:true});
       return safeReply(interaction,buildTicketSetupStep(interaction.guild,interaction.guildId));
     }
     // Server stats command
@@ -9377,7 +9948,7 @@ if(cmd==="divorce"){
       if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
       if(ticket.status==="closed")return safeReply(interaction,{content:"This ticket is already closed.",ephemeral:true});
       const cfg=ticketConfigs.get(ticket.guildId);
-      const isStaff=OWNER_IDS.includes(interaction.user.id)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>interaction.member.roles.cache.has(rid))||interaction.member.permissions.has("MANAGE_CHANNELS");
+      const isStaff=isTicketStaff(cfg,interaction.member);
       const canClose=ticket.userId===interaction.user.id||isStaff;
       if(!canClose)return safeReply(interaction,{content:"You don't have permission to close this ticket.",ephemeral:true});
       try{await interaction.channel.permissionOverwrites.edit(ticket.userId,{VIEW_CHANNEL:false,SEND_MESSAGES:false});}catch{}
@@ -9385,10 +9956,7 @@ if(cmd==="divorce"){
       ticket.closedBy=interaction.user.id;
       ticket.closedAt=Date.now();
       saveData();
-      const staffRow=new MessageActionRow().addComponents(
-        new MessageButton().setCustomId("ticket_reopen").setLabel("Reopen 🔓").setStyle("SUCCESS"),
-        new MessageButton().setCustomId("ticket_delete").setLabel("Delete Ticket 🗑️").setStyle("DANGER"),
-      );
+      const staffRow=buildTicketStaffRow();
       return safeReply(interaction,{content:`🔒 **Ticket #${ticket.ticketId} closed** by <@${interaction.user.id}>.\n\n*<@${ticket.userId}> no longer has access.*\n**Staff:** Use the buttons below to reopen or permanently delete this ticket.`,components:[staffRow]});
     }
     if(cmd==="addtoticket"){
@@ -9396,7 +9964,7 @@ if(cmd==="divorce"){
       const ticket=openTickets.get(interaction.channelId);
       if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
       const cfg=ticketConfigs.get(ticket.guildId);
-      const canManage=OWNER_IDS.includes(interaction.user.id)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>interaction.member.roles.cache.has(rid))||interaction.member.permissions.has("MANAGE_CHANNELS");
+      const canManage=isTicketStaff(cfg,interaction.member);
       if(!canManage)return safeReply(interaction,{content:"Only support staff can add users to tickets.",ephemeral:true});
       const target=interaction.options.getUser("user");
       try{await interaction.channel.permissionOverwrites.edit(target.id,{VIEW_CHANNEL:true,SEND_MESSAGES:true,READ_MESSAGE_HISTORY:true});return safeReply(interaction,`✅ <@${target.id}> has been added to this ticket.`);}
@@ -9407,7 +9975,7 @@ if(cmd==="divorce"){
       const ticket=openTickets.get(interaction.channelId);
       if(!ticket)return safeReply(interaction,{content:"This is not a ticket channel.",ephemeral:true});
       const cfg=ticketConfigs.get(ticket.guildId);
-      const canManage=OWNER_IDS.includes(interaction.user.id)||(cfg?.supportRoleIds||[cfg?.supportRoleId]).filter(Boolean).some(rid=>interaction.member.roles.cache.has(rid))||interaction.member.permissions.has("MANAGE_CHANNELS");
+      const canManage=isTicketStaff(cfg,interaction.member);
       if(!canManage)return safeReply(interaction,{content:"Only support staff can remove users from tickets.",ephemeral:true});
       const target=interaction.options.getUser("user");
       if(target.id===ticket.userId)return safeReply(interaction,{content:"You can't remove the ticket owner.",ephemeral:true});
@@ -9454,7 +10022,7 @@ if(cmd==="divorce"){
       const fileName = files[idx];
       const avatarUrl = targetUser.displayAvatarURL({ size:128, dynamic:true });
       return safeReply(interaction,{
-        ...buildLibraryEmbed(targetUser.username, avatarUrl, fileName, idx, files.length),
+        ...(await buildLibraryEmbed(targetUser.username, avatarUrl, fileName, idx, files.length)),
         components: makeLibraryButtons(targetUser.id, idx, files.length, false),
       });
     }
