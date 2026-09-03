@@ -80759,6 +80759,26 @@
         "creatorName": "royalvmusic",
         "createdAt": 1788390752020
       }
+    ],
+    [
+      "paav",
+      {
+        "triggers": [
+          "purge"
+        ],
+        "actions": [
+          {
+            "type": "purge",
+            "params": {
+              "amount": ""
+            }
+          }
+        ],
+        "ownerLocked": true,
+        "creatorId": "969280648667889764",
+        "creatorName": "royalvmusic",
+        "createdAt": 1788430991481
+      }
     ]
   ],
   "serverStatsConfig": [
