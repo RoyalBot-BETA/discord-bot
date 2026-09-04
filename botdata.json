@@ -58817,6 +58817,9 @@
       []
     ]
   ],
+  "userVoteStats": [],
+  "userFlagStats": [],
+  "pendingFlagDeleters": [],
   "reviewChannelId": "1533778635373281421",
   "deleterChannelId": "1533778596387356672",
   "trashcanThreshold": 1,
