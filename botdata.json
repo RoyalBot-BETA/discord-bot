@@ -80852,6 +80852,29 @@
         "creatorName": "royalvmusic",
         "createdAt": 1788430991481
       }
+    ],
+    [
+      "test2",
+      {
+        "triggers": [
+          "remind",
+          "reminder",
+          "tell me when"
+        ],
+        "actions": [
+          {
+            "type": "set_reminder",
+            "params": {
+              "minutes": "30",
+              "message": ""
+            }
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "969280648667889764",
+        "creatorName": "royalvmusic",
+        "createdAt": 1788559790090
+      }
     ]
   ],
   "serverStatsConfig": [
