@@ -42,7 +42,15 @@ const ffmpegPath = require("ffmpeg-static");
 })();
 
 const TOKEN     = process.env.TOKEN;
-const CLIENT_ID = "1480592876684706064";
+// Was hardcoded to the main bot's application ID — harmless for the main bot,
+// but since index_beta.cjs is shipped as a byte-identical copy, the beta bot
+// was authenticating with its own TOKEN while registering commands under the
+// MAIN bot's CLIENT_ID. Discord correctly 403s that mismatch (code 20012 —
+// "not authorized on this application"), which is why command registration
+// was failing for the beta bot specifically. Now reads from the environment
+// (same pattern as TOKEN) so each deployment's own CLIENT_ID secret is used;
+// falls back to the main bot's ID only if the env var isn't set.
+const CLIENT_ID = process.env.CLIENT_ID || "1480592876684706064";
 const OWNER_IDS = ["1419803002771865722","969280648667889764","363149593787105291"];
 const OWNER_ID  = OWNER_IDS[1];
 const GAY_IDS   = ["1245284545452834857","1413943805203189800","1057320311453913149","1193150033864949811"];
@@ -312,6 +320,28 @@ const quoteVoteMessages = new Map();
 
 // favoritedQuotes: userId -> Set<filename> — Patreon-exclusive quote favorites.
 const favoritedQuotes = new Map();
+
+// Per-user quote-voting/flagging stats — feeds /userprofile.
+// userVoteStats: userId -> { up, down } — quote up/down votes cast BY this user
+const userVoteStats = new Map();
+// userFlagStats: userId -> { flagged, deleted } — quotes this user flagged for
+// review (crossed the trashcan threshold, or flagged solo via /library), and
+// how many of those were actually deleted by an owner
+const userFlagStats = new Map();
+// pendingFlagDeleters: filename -> Set<userId> who flagged it, awaiting the
+// owner's Keep/Delete call in the deleter channel — read by del_delete_ to
+// credit userFlagStats.deleted, then cleared.
+const pendingFlagDeleters = new Map();
+function bumpVoteStat(userId, field, delta) {
+  let s = userVoteStats.get(userId);
+  if (!s) { s = { up:0, down:0 }; userVoteStats.set(userId, s); }
+  s[field] = Math.max(0, s[field]+delta);
+}
+function bumpFlagStat(userId, field) {
+  let s = userFlagStats.get(userId);
+  if (!s) { s = { flagged:0, deleted:0 }; userFlagStats.set(userId, s); }
+  s[field]++;
+}
 
 // ⚠️ NEEDS V's INPUT — see chat. These two are placeholders until filled in:
 //   PATREON_GUILD_ID: the Discord server ID where the Patreon role IDs below
@@ -959,6 +989,7 @@ function buildJarvisReplyModePicker(token){
     new MessageActionRow().addComponents(
       new MessageSelectMenu().setCustomId(`je_pickreply_${token}`).setPlaceholder("How should this be sent?").setOptions([
         { label:"💬 Reply to the message you're replying to", value:"reply", emoji:"💬" },
+        { label:"👤 Reply to you (whoever says the trigger)", value:"replyactor", emoji:"👤" },
         { label:"📢 Send normally (doesn't need you to be replying)", value:"normal", emoji:"📢" },
       ])
     ),
@@ -967,6 +998,15 @@ function buildJarvisReplyModePicker(token){
     ),
   ];
   return { content:`${def?.emoji||"📢"} **${def?.label||b.pendingActionType}** — how should it be sent?`, components:rows };
+}
+
+// Shared by echo/send_embed/theremnant: delivers a message per the picked
+// reply-mode — reply to the reply target, reply to whoever said the trigger,
+// or just post normally.
+async function deliverJarvisPayload(ctx, params, payload){
+  if(params.replyMode==="reply" && ctx.targetMsg) return ctx.targetMsg.reply(payload).catch(()=>{});
+  if(params.replyMode==="replyactor" && ctx.actorMsg) return ctx.actorMsg.reply(payload).catch(()=>{});
+  return ctx.channel.send(payload).catch(()=>{});
 }
 
 // Executes one saved profile's action chain in order against the resolved
@@ -1146,8 +1186,7 @@ const JARVISENHANCE_RUNNERS = {
   },
   async echo(params, ctx){
     const payload = { content:(params.message||"").slice(0,2000), allowedMentions:{parse:[]} };
-    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
-    else await ctx.channel.send(payload).catch(()=>{});
+    await deliverJarvisPayload(ctx, params, payload);
     return "done";
   },
   async send_embed(params, ctx){
@@ -1156,15 +1195,12 @@ const JARVISENHANCE_RUNNERS = {
     if(!embed.title) delete embed.title;
     if(!embed.description) delete embed.description;
     if(!embed.title && !embed.description) return "nothing to send";
-    const payload = { embeds:[embed] };
-    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
-    else await ctx.channel.send(payload).catch(()=>{});
+    await deliverJarvisPayload(ctx, params, { embeds:[embed] });
     return "done";
   },
   async theremnant(params, ctx){
     const payload = { embeds:[{ title:"👁️ The Remnant", description:(params.message||"").slice(0,1000), color:0x8E44AD, footer:{text:"A signal from somewhere else…"}, timestamp:new Date().toISOString() }] };
-    if(params.replyMode==="reply" && ctx.targetMsg) await ctx.targetMsg.reply(payload).catch(()=>{});
-    else await ctx.channel.send(payload).catch(()=>{});
+    await deliverJarvisPayload(ctx, params, payload);
     return "done";
   },
   async purge(params, ctx){
@@ -1269,6 +1305,21 @@ async function runJarvisEnhanceProfile(profile, ctx){
     if(!def || !runner){ results.push(`❓ ${step.type}: unknown action`); continue; }
     try{
       let params = step.params||{};
+      // Template placeholders: a {anything} token typed into ANY field gets
+      // replaced with whatever text followed the trigger word — works
+      // anywhere in a field, not just when the field is entirely blank, e.g.
+      // a nickname field set to literally "{nickname}", or a message field
+      // set to "Welcome {text} to the crew!".
+      const hasPlaceholder = Object.values(params).some(v => typeof v==="string" && /\{[^}]*\}/.test(v));
+      if(hasPlaceholder){
+        const filled = {};
+        for(const [k,v] of Object.entries(params)){
+          filled[k] = typeof v==="string" ? v.replace(/\{[^}]*\}/g, ctx.restText||"") : v;
+        }
+        params = filled;
+      }
+      // Shorthand: leaving the dynamic field entirely blank still falls back
+      // to the full trailing text, no {…} needed.
       if(def.dynamicField && !(params[def.dynamicField]||"").trim() && ctx.restText){
         params = { ...params, [def.dynamicField]: ctx.restText };
       }
@@ -1503,6 +1554,13 @@ let jarvisCacheFetchedAt = 0;
 const JARVIS_CACHE_TTL_MS = 2 * 60 * 1000; // refresh at most every 2 minutes
 
 // ── /jarvislist — paginated embed gallery of every image in the Jarvis folder ──
+// ── /userprofile — Patreon-exclusive supporter profile card ────────────────────
+function renderStatBar(pct) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  const filled = Math.round(clamped/10);
+  return "🟨".repeat(filled) + "⬛".repeat(10-filled) + ` ${Math.round(clamped)}%`;
+}
+
 function buildJarvisListPage(images, page, pageSize=5) {
   const totalPages = Math.max(1, Math.ceil(images.length/pageSize));
   const p = Math.max(0, Math.min(page, totalPages-1));
@@ -2013,6 +2071,9 @@ function buildDataObject() {
     quoteVotes:           [...quoteVotes.entries()],
     quoteVoteMessages:    [...quoteVoteMessages.entries()],
     favoritedQuotes:      [...favoritedQuotes.entries()].map(([k,v]) => [k, [...v]]),
+    userVoteStats:        [...userVoteStats.entries()],
+    userFlagStats:        [...userFlagStats.entries()],
+    pendingFlagDeleters:  [...pendingFlagDeleters.entries()].map(([k,v]) => [k, [...v]]),
     reviewChannelId:      reviewChannelId,
     deleterChannelId:     deleterChannelId,
     trashcanThreshold:    trashcanThreshold,
@@ -2270,6 +2331,9 @@ function loadData() {
     }
     if (data.quoteVoteMessages)  data.quoteVoteMessages.forEach(([k,v]) => quoteVoteMessages.set(k, v));
     if (data.favoritedQuotes)    data.favoritedQuotes.forEach(([k,v]) => favoritedQuotes.set(k, new Set(v)));
+    if (data.userVoteStats)      data.userVoteStats.forEach(([k,v]) => userVoteStats.set(k, v));
+    if (data.userFlagStats)      data.userFlagStats.forEach(([k,v]) => userFlagStats.set(k, v));
+    if (data.pendingFlagDeleters) data.pendingFlagDeleters.forEach(([k,v]) => pendingFlagDeleters.set(k, new Set(v)));
 
     if (typeof data.dmRelayGuildId === "string") dmRelayGuildId = data.dmRelayGuildId;
     if (data.dmRelayChannels) {
@@ -4423,7 +4487,7 @@ function buildCommands(){
       {name:"name",description:"Profile ID (required for create/edit/delete)",type:3,required:false},
     ]},
     {name:"jarvislist", description:"Show every image in the Jarvis folder — filename + preview, paginated"},
-    {name:"favoritelibrary", description:"[Patreon] Browse your favorited quotes"},
+    {name:"userprofile", description:"[Patreon] View your supporter profile, marriage, roles, quote stats, favorites etc"},
     {name:"download", description:"Download a YouTube video as MP4 or MP3",options:[
       {name:"url",        description:"YouTube video URL",type:3,required:true},
       {name:"format",     description:"File format (default: MP4)",type:3,required:false,choices:[
@@ -4746,19 +4810,6 @@ function makeQuoteVoteButtons(msgId, votes, trashData) {
   ];
 }
 
-// Nav buttons for /favoritelibrary — same idea as makeLibraryButtons, but
-// scoped to the clicking user's own favorites (no targetUserId needed) and
-// with a Remove Favorite button instead of Flag for Review.
-function buildFavoriteLibraryButtons(idx, total) {
-  return [
-    new MessageActionRow().addComponents(
-      new MessageButton().setCustomId(`flib_prev_${idx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(idx===0),
-      new MessageButton().setCustomId(`flib_next_${idx}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(total<=1||idx>=total-1),
-      new MessageButton().setCustomId(`flib_unfav_${idx}`).setLabel("Remove Favorite").setStyle("DANGER").setEmoji({ name:"⭐" }),
-    ),
-  ];
-}
-
 // ── Library embed & components ────────────────────────────────────────────────
 // Renders a user's uploaded-quotes library as an embed (image + prev/next/goto
 // paging), with a 🗑️ button to flag the currently-viewed image for owner review.
@@ -4794,6 +4845,26 @@ function makeLibraryButtons(targetUserId, idx, total, flagged) {
         .setStyle(flagged ? "SECONDARY" : "DANGER")
         .setEmoji(trashE ? { id: trashE.id, name: trashE.name } : { name: "🗑️" })
         .setDisabled(!!flagged),
+      new MessageButton()
+        .setCustomId(`libfav_${targetUserId}`)
+        .setLabel("Favorites")
+        .setStyle("SECONDARY")
+        .setEmoji({ name:"⭐" }),
+    ),
+  ];
+}
+
+// Nav buttons for browsing favorites (accessed via the Favorites button on
+// /library) — same idea as makeLibraryButtons, but scoped to the clicking
+// user's own favorites, with a Remove Favorite button instead of Flag for
+// Review, and a Back button to return to whichever library was being viewed.
+function buildFavoriteLibraryButtons(idx, total, backToUserId) {
+  return [
+    new MessageActionRow().addComponents(
+      new MessageButton().setCustomId(`flib_prev_${backToUserId}_${idx}`).setLabel("◀ Prev").setStyle("SECONDARY").setDisabled(idx===0),
+      new MessageButton().setCustomId(`flib_next_${backToUserId}_${idx}`).setLabel("Next ▶").setStyle("SECONDARY").setDisabled(total<=1||idx>=total-1),
+      new MessageButton().setCustomId(`flib_unfav_${backToUserId}_${idx}`).setLabel("Remove Favorite").setStyle("DANGER").setEmoji({ name:"⭐" }),
+      new MessageButton().setCustomId(`flib_back_${backToUserId}`).setLabel("◀ Back to Library").setStyle("PRIMARY"),
     ),
   ];
 }
@@ -5758,7 +5829,7 @@ client.on("messageCreate",async msg=>{
               const ctx = {
                 targetMsg, targetUser: targetMsg ? targetMsg.author : null, targetMember,
                 channel: msg.channel, guild: msg.guild, restText,
-                actorId: msg.author.id, actorUser: msg.author,
+                actorId: msg.author.id, actorUser: msg.author, actorMsg: msg,
               };
               await runJarvisEnhanceProfile(profile, ctx);
             }
@@ -6211,6 +6282,13 @@ client.on("interactionCreate",async interaction=>{
           if(Array.isArray(s.uploadedImages)&&s.uploadedImages.includes(fileName))
             s.uploadedImages = s.uploadedImages.filter(n=>n!==fileName);
         }
+        // Clean from everyone's favorites — a deleted quote shouldn't leave a
+        // dangling favorite pointing at a file that no longer exists.
+        for(const [,favSet] of favoritedQuotes){ favSet.delete(fileName); }
+        // Credit whoever flagged this — their flag was correct.
+        const flaggers = pendingFlagDeleters.get(fileName);
+        if(flaggers){ for(const flaggerId of flaggers) bumpFlagStat(flaggerId, "deleted"); }
+        pendingFlagDeleters.delete(fileName);
         saveData();
         try{
           await interaction.editReply({
@@ -6281,23 +6359,61 @@ client.on("interactionCreate",async interaction=>{
       return;
     }
 
-    // ── /favoritelibrary pagination (Patreon-exclusive) ──────────────────────────
-    if(cid.startsWith("flib_prev_")||cid.startsWith("flib_next_")||cid.startsWith("flib_unfav_")){
+    // ── /library "Favorites" button (Patreon-exclusive) — switches the view ────
+    if(cid.startsWith("libfav_")){
+      const backToUserId = cid.slice("libfav_".length);
       if(!(await isPatreonMember(uid))){
         try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
         return;
       }
       const favSet = favoritedQuotes.get(uid);
+      const files = favSet ? [...favSet] : [];
+      if(!files.length){ try{await interaction.reply({content:"⭐ You haven't favorited any quotes yet — click the ⭐ Favorite button on a quote to add one.",ephemeral:true});}catch{} return; }
+      const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
+      try{
+        await interaction.update({
+          ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, files[0], 0, files.length)),
+          components: buildFavoriteLibraryButtons(0, files.length, backToUserId),
+        });
+      }catch{}
+      return;
+    }
+
+    // ── Favorites pagination (Patreon-exclusive) ─────────────────────────────────
+    if(cid.startsWith("flib_prev_")||cid.startsWith("flib_next_")||cid.startsWith("flib_unfav_")||cid.startsWith("flib_back_")){
+      if(!(await isPatreonMember(uid))){
+        try{await interaction.reply({content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});}catch{}
+        return;
+      }
+      const [,action,backToUserId,idxStr] = cid.match(/^flib_(prev|next|unfav|back)_(\d+)(?:_(\d+))?$/) || [];
+      if(!action) return;
+
+      if(action==="back"){
+        const targetScore = getScore(backToUserId, null);
+        const files = targetScore.uploadedImages || [];
+        if(!files.length){ try{await interaction.update({content:"That library is empty now.", embeds:[], components:[]});}catch{} return; }
+        const displayName = await client.users.fetch(backToUserId).then(u=>u.username).catch(()=>"User");
+        const avatarUrl = await client.users.fetch(backToUserId).then(u=>u.displayAvatarURL({size:128,dynamic:true})).catch(()=>null);
+        try{
+          await interaction.update({
+            ...(await buildLibraryEmbed(displayName, avatarUrl, files[0], 0, files.length)),
+            components: makeLibraryButtons(backToUserId, 0, files.length, false),
+          });
+        }catch{}
+        return;
+      }
+
+      const favSet = favoritedQuotes.get(uid);
       let files = favSet ? [...favSet] : [];
       if(!files.length){ try{await interaction.update({content:"⭐ You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
-      let idx = parseInt(cid.slice(cid.lastIndexOf("_")+1),10)||0;
-      if(cid.startsWith("flib_unfav_")){
+      let idx = parseInt(idxStr,10)||0;
+      if(action==="unfav"){
         const removedName = files[idx];
         favSet.delete(removedName);
         saveData();
         files = [...favSet];
         if(!files.length){ try{await interaction.update({content:"⭐ Removed. You don't have any favorited quotes left.", embeds:[], components:[]});}catch{} return; }
-      } else if(cid.startsWith("flib_next_")){
+      } else if(action==="next"){
         idx = idx+1;
       } else {
         idx = idx-1;
@@ -6308,7 +6424,7 @@ client.on("interactionCreate",async interaction=>{
       try{
         await interaction.update({
           ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, fn, idx, files.length)),
-          components: buildFavoriteLibraryButtons(idx, files.length),
+          components: buildFavoriteLibraryButtons(idx, files.length, backToUserId),
         });
       }catch{}
       return;
@@ -6391,6 +6507,8 @@ client.on("interactionCreate",async interaction=>{
           // Check threshold
           if(!tv.sentToDeleter && tv.voters.size >= trashcanThreshold && deleterChannelId){
             tv.sentToDeleter = true;
+            pendingFlagDeleters.set(tv.filename, new Set(tv.voters));
+            for(const voterId of tv.voters) bumpFlagStat(voterId, "flagged");
             (async()=>{
               try{
                 const deleterCh = await client.channels.fetch(deleterChannelId).catch(()=>null);
@@ -6435,15 +6553,15 @@ client.on("interactionCreate",async interaction=>{
 
       if(prevVote === newVote){
         // Same button again → remove vote
-        if(newVote==="up")   v.up   = Math.max(0, v.up-1);
-        else                 v.down = Math.max(0, v.down-1);
+        if(newVote==="up")   { v.up   = Math.max(0, v.up-1);   bumpVoteStat(uid,"up",-1); }
+        else                 { v.down = Math.max(0, v.down-1); bumpVoteStat(uid,"down",-1); }
         userVoteMap.delete(uid);
       } else {
         // New vote or switching sides
-        if(prevVote==="up")   v.up   = Math.max(0, v.up-1);
-        if(prevVote==="down") v.down = Math.max(0, v.down-1);
-        if(newVote==="up")    v.up++;
-        else                  v.down++;
+        if(prevVote==="up")   { v.up   = Math.max(0, v.up-1);   bumpVoteStat(uid,"up",-1); }
+        if(prevVote==="down") { v.down = Math.max(0, v.down-1); bumpVoteStat(uid,"down",-1); }
+        if(newVote==="up")    { v.up++;   bumpVoteStat(uid,"up",1); }
+        else                  { v.down++; bumpVoteStat(uid,"down",1); }
         userVoteMap.set(uid, newVote);
       }
 
@@ -6872,6 +6990,9 @@ client.on("interactionCreate",async interaction=>{
       }
 
       if(!(await btnAck(interaction))) return;
+
+      pendingFlagDeleters.set(fileName, new Set([uid]));
+      bumpFlagStat(uid, "flagged");
 
       try{
         const deleterCh = await client.channels.fetch(deleterChannelId).catch(()=>null);
@@ -8756,19 +8877,48 @@ if(cmd==="jarvislist"){
   return safeReply(interaction, buildJarvisListPage(images, 0));
 }
 
-if(cmd==="favoritelibrary"){
+if(cmd==="userprofile"){
   if(!(await isPatreonMember(interaction.user.id)))
     return safeReply(interaction,{content:`Oops, this is a patreon exclusive feature! Try to support RoyalBot here if you wish (pls) ${PATREON_LINK}`,ephemeral:true});
-  const favSet = favoritedQuotes.get(interaction.user.id);
-  const files = favSet ? [...favSet] : [];
-  if(!files.length)
-    return safeReply(interaction,{content:"⭐ You haven't favorited any quotes yet — click the ⭐ Favorite button on a quote to add one.",ephemeral:true});
-  const avatarUrl = interaction.user.displayAvatarURL({size:128,dynamic:true});
-  return safeReply(interaction,{
-    ...(await buildLibraryEmbed(`${interaction.user.username} (Favorites)`, avatarUrl, files[0], 0, files.length)),
-    components: buildFavoriteLibraryButtons(0, files.length),
-    ephemeral:true,
-  });
+
+  const puid = interaction.user.id;
+  const s = getScore(puid, interaction.user.username);
+  const marriedText = s.marriedTo ? `💍 <@${s.marriedTo}>` : "💔 Not married";
+
+  let highestRoleText = "_No roles_";
+  if(interaction.inGuild() && interaction.member){
+    const hr = interaction.member.roles.highest;
+    if(hr && hr.id !== interaction.guild.id) highestRoleText = `${hr}`;
+  }
+
+  const vStats = userVoteStats.get(puid) || { up:0, down:0 };
+  const totalVotes = vStats.up + vStats.down;
+  const likedPct = totalVotes ? (vStats.up/totalVotes*100) : 0;
+  const dislikedPct = totalVotes ? (vStats.down/totalVotes*100) : 0;
+
+  const fStats = userFlagStats.get(puid) || { flagged:0, deleted:0 };
+  const flagAccuracyPct = fStats.flagged ? (fStats.deleted/fStats.flagged*100) : 0;
+
+  const favCount = favoritedQuotes.get(puid)?.size || 0;
+
+  const embed = {
+    color: 0xFFD700,
+    author: { name: `👑 ${interaction.user.username} — Patreon Supporter`, icon_url: interaction.user.displayAvatarURL({dynamic:true}) },
+    title: "✨ Supporter Profile ✨",
+    thumbnail: { url: interaction.user.displayAvatarURL({ size:512, dynamic:true }) },
+    fields: [
+      { name: "💍 Married", value: marriedText, inline:true },
+      { name: "🏅 Highest Role", value: highestRoleText, inline:true },
+      { name: "⭐ Favorited Quotes", value: `${favCount}`, inline:true },
+      { name: "👍 Liked Quotes", value: `${renderStatBar(likedPct)}\n(${vStats.up} votes cast)`, inline:false },
+      { name: "👎 Disliked Quotes", value: `${renderStatBar(dislikedPct)}\n(${vStats.down} votes cast)`, inline:false },
+      { name: "🗑️ Flag Accuracy", value: `${renderStatBar(flagAccuracyPct)}\n(${fStats.deleted}/${fStats.flagged} flagged quotes were deleted)`, inline:false },
+    ],
+    footer: { text: "Thank you for supporting RoyalBot! 🧡🍔" },
+    timestamp: new Date().toISOString(),
+  };
+
+  return safeReply(interaction, { embeds:[embed] });
 }
 
 if(cmd==="theremnant"){
