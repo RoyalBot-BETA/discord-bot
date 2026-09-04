@@ -4912,7 +4912,7 @@
           "profile_badge_common",
           "lottery_ticket"
         ],
-        "marriedTo": null,
+        "marriedTo": "1254388539890860083",
         "pendingProposal": null,
         "forceMarried": false,
         "imagesUploaded": 354,
@@ -6935,8 +6935,8 @@
         "lastCrimeTime": 0,
         "lastRobTime": 0,
         "inventory": [],
-        "marriedTo": null,
-        "pendingProposal": "969280648667889764",
+        "marriedTo": "969280648667889764",
+        "pendingProposal": null,
         "forceMarried": false,
         "imagesUploaded": 168,
         "uploadedImages": [
