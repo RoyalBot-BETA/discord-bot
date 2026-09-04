@@ -80910,6 +80910,27 @@
         "creatorName": "royalvmusic",
         "createdAt": 1788562072185
       }
+    ],
+    [
+      "nothertest",
+      {
+        "triggers": [
+          "rob"
+        ],
+        "actions": [
+          {
+            "type": "echo",
+            "params": {
+              "message": "Are you broke, Sir?",
+              "replyMode": "replyactor"
+            }
+          }
+        ],
+        "ownerLocked": false,
+        "creatorId": "969280648667889764",
+        "creatorName": "royalvmusic",
+        "createdAt": 1788565119306
+      }
     ]
   ],
   "serverStatsConfig": [
