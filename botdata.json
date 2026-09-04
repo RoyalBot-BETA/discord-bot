@@ -80875,6 +80875,34 @@
         "creatorName": "royalvmusic",
         "createdAt": 1788559790090
       }
+    ],
+    [
+      "status",
+      {
+        "triggers": [
+          "blankism",
+          "destroy"
+        ],
+        "actions": [
+          {
+            "type": "set_nickname",
+            "params": {
+              "nickname": ""
+            }
+          },
+          {
+            "type": "clankerify",
+            "params": {
+              "mode": "uwu",
+              "duration": "10"
+            }
+          }
+        ],
+        "ownerLocked": true,
+        "creatorId": "969280648667889764",
+        "creatorName": "royalvmusic",
+        "createdAt": 1788562072185
+      }
     ]
   ],
   "serverStatsConfig": [
