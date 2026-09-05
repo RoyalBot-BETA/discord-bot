@@ -4529,7 +4529,20 @@
     "1520763926105821276"
   ],
   "featureBlacklist": [],
-  "tempOwnerGrants": [],
+  "tempOwnerGrants": [
+    [
+      "1254388539890860083",
+      {
+        "commands": [
+          "restart"
+        ],
+        "features": [],
+        "expiresAt": null,
+        "grantedBy": "969280648667889764",
+        "grantedAt": 1788613683714
+      }
+    ]
+  ],
   "scores": [
     [
       "1245284545452834857",
