@@ -58903,8 +58903,23 @@
       }
     ]
   ],
-  "userFlagStats": [],
-  "pendingFlagDeleters": [],
+  "userFlagStats": [
+    [
+      "1254388539890860083",
+      {
+        "flagged": 1,
+        "deleted": 0
+      }
+    ]
+  ],
+  "pendingFlagDeleters": [
+    [
+      "IMG_5005.png",
+      [
+        "1254388539890860083"
+      ]
+    ]
+  ],
   "reviewChannelId": "1533778635373281421",
   "deleterChannelId": "1533778596387356672",
   "trashcanThreshold": 1,
@@ -80634,10 +80649,12 @@
       "1546839440897478766",
       {
         "filename": "IMG_5005.png",
-        "voters": [],
+        "voters": [
+          "1254388539890860083"
+        ],
         "guildId": "1533594455125397654",
         "channelId": "1533606778112053478",
-        "sentToDeleter": false,
+        "sentToDeleter": true,
         "type": "quote"
       }
     ]
