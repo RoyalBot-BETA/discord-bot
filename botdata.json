@@ -481,12 +481,8 @@
         "channelTitle": "RespawnRaccoon",
         "discordChannelId": "1483595393999700080",
         "lastSubs": 19000,
-        "lastSubsTimestamp": 1795101302759,
+        "lastSubsTimestamp": 1795101602826,
         "history": [
-          {
-            "ts": 1794797117677,
-            "subs": 19000
-          },
           {
             "ts": 1794797417703,
             "subs": 19000
@@ -4481,6 +4477,10 @@
           },
           {
             "ts": 1795101302759,
+            "subs": 19000
+          },
+          {
+            "ts": 1795101602826,
             "subs": 19000
           }
         ],
